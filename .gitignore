@@ -1,0 +1,28 @@
+# Binaries
+/homekit-rtsp-proxy
+/homekit-rtsp-proxy-*
+/debug-pair
+/test-rtsp
+*.exe
+
+# Runtime data
+config.yaml
+pairings.json
+.hkontroller/
+
+# Logs
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker build context (large cached modules)
+vendor/

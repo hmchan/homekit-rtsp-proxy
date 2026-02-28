@@ -1,0 +1,42 @@
+# HomeKit Camera RTSP Proxy Configuration
+
+log_level: info                    # debug, info, warn, error
+pairing_store: ./pairings.json     # Path to persist HomeKit pairing keys
+# bind_address: 192.168.1.10      # Override auto-detected local IP
+
+cameras:
+  - name: "Front Door"
+    setup_code: "031-45-154"       # HomeKit setup code (on camera or in manual)
+    device_id: "AA:BB:CC:DD:EE:FF" # Optional: HomeKit device ID (auto-discovered if omitted)
+    rtsp:
+      port: 8554                   # RTSP server port for this camera
+      path: "/live"                # RTSP stream path
+    video:
+      width: 1920
+      height: 1080
+      fps: 30
+      max_bitrate: 2000            # kbps
+    audio:
+      enabled: true
+      codec: "aac-eld"
+      sample_rate: 16000           # Hz
+    onvif:
+      enabled: true                # Enable ONVIF server for motion events
+      port: 8580                   # ONVIF HTTP port
+
+  # Additional cameras use different ports:
+  # - name: "Back Yard"
+  #   setup_code: "123-45-678"
+  #   rtsp:
+  #     port: 8555
+  #     path: "/live"
+  #   video:
+  #     width: 1920
+  #     height: 1080
+  #     fps: 30
+  #     max_bitrate: 2000
+  #   audio:
+  #     enabled: true
+  #   onvif:
+  #     enabled: true
+  #     port: 8581
