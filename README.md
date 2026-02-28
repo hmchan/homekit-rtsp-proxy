@@ -223,17 +223,17 @@ go build -o test-rtsp ./cmd/test-rtsp/
 
 ## Known Limitations
 
-- **AAC-ELD only tested:** Opus codec negotiation is implemented but untested. Reolink E1 cameras reject Opus.
+- **AAC-ELD only tested:** Opus codec negotiation is implemented but untested. Aqara Camera E1 rejects Opus.
 - **Single stream per camera:** Uses one of the camera's limited concurrent stream slots.
 - **No automatic stream recovery:** If the camera drops the SRTP stream, the RTSP client must reconnect.
-- **Audio gain is hardcoded:** The 54dB gain compensation is tuned for Reolink E1. Other cameras may need adjustment.
+- **Audio gain is hardcoded:** The 54dB gain compensation is tuned for Aqara Camera E1. Other cameras may need adjustment.
 - **No talkback:** Silence packets satisfy the protocol, but real two-way audio is not implemented.
 
 ## Tested Cameras
 
 | Camera | Video | Audio | Motion Events |
 |--------|-------|-------|---------------|
-| Reolink E1 Zoom | 1080p30 H.264 | AAC-ELD 16kHz | Yes (HAP events) |
+| Aqara Camera E1 | 1080p30 H.264 | AAC-ELD 16kHz | Yes (HAP events) |
 
 ## License
 

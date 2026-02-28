@@ -40,7 +40,7 @@ HomeKit cameras expose streams only through the proprietary HAP/SRTP protocol. T
 │  ┌──────────────┐    mDNS     ┌───────────────────────────┐    │
 │  │   HomeKit     │◄──────────►│   homekit-rtsp-proxy      │    │
 │  │   Camera      │            │                           │    │
-│  │  (Reolink E1) │   HAP/TCP  │  ┌─────────────────────┐ │    │
+│  │  (Aqara Camera E1) │   HAP/TCP  │  ┌─────────────────────┐ │    │
 │  │               │◄──────────►│  │  HAP Controller     │ │    │
 │  │               │            │  │  (pair, verify,     │ │    │
 │  │               │  SRTP/UDP  │  │   stream mgmt)      │ │    │
@@ -850,13 +850,13 @@ Minimal RTSP server that sends synthetic H.264 frames (STAP-A + IDR + P-frames) 
 
 ## 9. Known Limitations & Gotchas
 
-1. **AAC-ELD only:** Reolink E1 cameras reject Opus (error -70410). The codec negotiation is hardcoded to AAC-ELD. Cameras that only support Opus would need code changes.
+1. **AAC-ELD only:** Aqara Camera E1 cameras reject Opus (error -70410). The codec negotiation is hardcoded to AAC-ELD. Cameras that only support Opus would need code changes.
 
 2. **Single stream per camera:** HomeKit cameras typically support only 1–2 concurrent streams. The proxy uses one. If the camera's stream limit is reached, `StartStream` will fail.
 
 3. **No SPS/PPS in SDP:** The H.264 format is initialized without SPS/PPS (extracted from the first in-band STAP-A). Some strict RTSP clients may reject the initial SDP. The IDR injection mechanism mitigates this.
 
-4. **Audio gain hardcoded:** The ×512 gain factor is specific to the Reolink E1's AAC-ELD output. Other cameras may need different gain values.
+4. **Audio gain hardcoded:** The ×512 gain factor is specific to the Aqara Camera E1's AAC-ELD output. Other cameras may need different gain values.
 
 5. **`mediacommon/v2` AAC-ELD bug:** The library cannot correctly encode AAC-ELD AudioSpecificConfig. A hardcoded hex string is used instead of computed SDP parameters.
 
