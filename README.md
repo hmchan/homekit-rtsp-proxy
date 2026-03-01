@@ -102,6 +102,18 @@ cameras:
       port: 8580
 ```
 
+### Audio gain
+
+The `audio.gain` setting controls PCM amplification during AAC-ELD to AAC-LC transcoding. Some HomeKit cameras (notably Aqara Camera E1) produce very quiet AAC-ELD audio -- the decoded PCM peaks at ~7 out of 32767, roughly 54dB below normal levels. The gain multiplier compensates for this.
+
+| Value | Effect |
+|-------|--------|
+| `512` | Default. Amplifies ~54dB to bring quiet cameras to normal levels |
+| `0` | No amplification -- decoded PCM passes through unchanged |
+| `1` - `1024` | Custom amplification. Higher values = louder. Output is hard-clipped at 16-bit range (±32767) |
+
+Set `gain: 0` if your camera's audio is already at normal levels, or if you don't need audio amplification.
+
 ### Logging
 
 All logs are written to **stdout** using Go's structured `slog` package. Control verbosity with `log_level` in the config file:
