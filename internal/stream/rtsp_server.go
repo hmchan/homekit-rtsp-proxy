@@ -72,6 +72,7 @@ type RTSPServerConfig struct {
 	HasAudio   bool
 	AudioCodec string // "aac-eld" or "opus"
 	SampleRate int
+	AudioGain  int // PCM gain factor for AAC-ELD→AAC-LC transcoding
 }
 
 // NewRTSPServer creates a new RTSP server for a single camera.
@@ -124,7 +125,7 @@ func NewRTSPServer(cfg RTSPServerConfig, session *Session, logger *slog.Logger) 
 				eldASC = "F8F82000"
 			}
 
-			transcoder, err := NewAudioTranscoder(sampleRate, eldASC)
+			transcoder, err := NewAudioTranscoder(sampleRate, eldASC, cfg.AudioGain)
 			if err != nil {
 				logger.Error("failed to create audio transcoder, audio disabled", "error", err)
 				break

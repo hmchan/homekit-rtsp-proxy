@@ -20,6 +20,7 @@ cameras:
       enabled: true
       codec: "aac-eld"
       sample_rate: 16000           # Hz
+      gain: 512                    # PCM gain for AAC-ELD→AAC-LC transcoding (0 = passthrough, 512 ≈ 54dB)
     onvif:
       enabled: true                # Enable ONVIF server for motion events
       port: 8580                   # ONVIF HTTP port

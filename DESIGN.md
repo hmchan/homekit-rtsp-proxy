@@ -34,35 +34,35 @@ HomeKit cameras expose streams only through the proprietary HAP/SRTP protocol. T
 ### 2.1 System Context
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                        Local Network                            │
-│                                                                 │
-│  ┌──────────────┐    mDNS     ┌───────────────────────────┐    │
-│  │   HomeKit     │◄──────────►│   homekit-rtsp-proxy      │    │
-│  │   Camera      │            │                           │    │
-│  │  (Aqara Camera E1) │   HAP/TCP  │  ┌─────────────────────┐ │    │
-│  │               │◄──────────►│  │  HAP Controller     │ │    │
-│  │               │            │  │  (pair, verify,     │ │    │
-│  │               │  SRTP/UDP  │  │   stream mgmt)      │ │    │
-│  │               │───────────►│  └─────────────────────┘ │    │
-│  └──────────────┘            │  ┌─────────────────────┐ │    │
-│                               │  │  SRTP Proxy         │ │    │
-│                               │  │  (decrypt → RTP)    │ │    │
-│                               │  └─────────────────────┘ │    │
-│                               │  ┌─────────────────────┐ │    │
-│  ┌──────────────┐   RTSP/TCP  │  │  RTSP Server        │ │    │
-│  │  Scrypted /   │◄──────────►│  │  (gortsplib)        │ │    │
-│  │  ffmpeg /     │            │  └─────────────────────┘ │    │
-│  │  VLC          │            │  ┌─────────────────────┐ │    │
-│  └──────────────┘            │  │  Audio Transcoder   │ │    │
-│                               │  │  (AAC-ELD → AAC-LC) │ │    │
-│  ┌──────────────┐  ONVIF/HTTP │  └─────────────────────┘ │    │
-│  │  Scrypted     │◄──────────►│  ┌─────────────────────┐ │    │
-│  │  (motion      │            │  │  ONVIF Server       │ │    │
-│  │   events)     │            │  │  (PullPoint events) │ │    │
-│  └──────────────┘            │  └─────────────────────┘ │    │
-│                               └───────────────────────────┘    │
-└─────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│                            Local Network                             │
+│                                                                      │
+│  ┌───────────────────┐    mDNS     ┌───────────────────────────┐    │
+│  │   HomeKit Camera   │◄──────────►│   homekit-rtsp-proxy      │    │
+│  │  (Aqara Camera E1) │            │                           │    │
+│  │                    │   HAP/TCP  │  ┌─────────────────────┐ │    │
+│  │                    │◄──────────►│  │  HAP Controller     │ │    │
+│  │                    │            │  │  (pair, verify,     │ │    │
+│  │                    │  SRTP/UDP  │  │   stream mgmt)      │ │    │
+│  │                    │───────────►│  └─────────────────────┘ │    │
+│  └───────────────────┘            │  ┌─────────────────────┐ │    │
+│                                    │  │  SRTP Proxy         │ │    │
+│                                    │  │  (decrypt → RTP)    │ │    │
+│                                    │  └─────────────────────┘ │    │
+│                                    │  ┌─────────────────────┐ │    │
+│  ┌──────────────┐       RTSP/TCP  │  │  RTSP Server        │ │    │
+│  │  Scrypted /   │◄──────────────►│  │  (gortsplib)        │ │    │
+│  │  ffmpeg /     │                │  └─────────────────────┘ │    │
+│  │  VLC          │                │  ┌─────────────────────┐ │    │
+│  └──────────────┘                │  │  Audio Transcoder   │ │    │
+│                                    │  │  (AAC-ELD → AAC-LC) │ │    │
+│  ┌──────────────┐      ONVIF/HTTP │  └─────────────────────┘ │    │
+│  │  Scrypted     │◄──────────────►│  ┌─────────────────────┐ │    │
+│  │  (motion      │                │  │  ONVIF Server       │ │    │
+│  │   events)     │                │  │  (PullPoint events) │ │    │
+│  └──────────────┘                │  └─────────────────────┘ │    │
+│                                    └───────────────────────────┘    │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
 ### 2.2 Component Diagram
@@ -125,7 +125,7 @@ Camera ──SRTP/UDP──► SRTPProxy.readAudioLoop()
                                                 ├─ AudioTranscoder.Transcode()
                                                 │      │
                                                 │      ├─ Decode AAC-ELD → PCM
-                                                │      ├─ Amplify ×512
+                                                │      ├─ Amplify ×gain (configurable, default 512)
                                                 │      └─ Encode PCM → AAC-LC
                                                 │
                                                 ├─ Build new AU header
@@ -386,6 +386,7 @@ type CameraConfig struct {
 | `audio.enabled` | `true` |
 | `audio.codec` | `"aac-eld"` |
 | `audio.sample_rate` | `16000` (Hz) |
+| `audio.gain` | `512` (~54dB amplification) |
 | `onvif.enabled` | `false` |
 | `onvif.port` | `8580` |
 
@@ -633,7 +634,7 @@ libfdk-aac decoder (AAC-ELD, 512 samples/frame)
 PCM int16 samples (peak ~7/32767 — very quiet!)
     │
     ▼
-Amplify ×512 (+54dB), clamp ±32767
+Amplify ×gain (configurable, default 512 ≈ +54dB), clamp ±32767
     │
     ▼
 Accumulate in ring buffer
@@ -673,7 +674,7 @@ AAC-ELD produces 512 samples per frame; AAC-LC consumes 1024 samples per frame. 
 
 #### 4.10.4 Gain Compensation
 
-The AAC-ELD decoder output is approximately 54dB below expected levels (peak amplitude ~7 out of 32767). The cause appears to be DRC (Dynamic Range Control) metadata embedded in the camera's AAC-ELD stream. DRC is disabled in the decoder, and a ×512 gain factor is applied post-decode with hard clipping at ±32767.
+The AAC-ELD decoder output is approximately 54dB below expected levels (peak amplitude ~7 out of 32767). The cause appears to be DRC (Dynamic Range Control) metadata embedded in the camera's AAC-ELD stream. DRC is disabled in the decoder, and a configurable gain factor is applied post-decode with hard clipping at ±32767. The gain defaults to 512 (~54dB) and can be set per-camera via `audio.gain` in the config (0 = passthrough, no amplification).
 
 ### 4.11 ONVIF Server (`internal/onvif/`)
 
@@ -856,7 +857,7 @@ Minimal RTSP server that sends synthetic H.264 frames (STAP-A + IDR + P-frames) 
 
 3. **No SPS/PPS in SDP:** The H.264 format is initialized without SPS/PPS (extracted from the first in-band STAP-A). Some strict RTSP clients may reject the initial SDP. The IDR injection mechanism mitigates this.
 
-4. **Audio gain hardcoded:** The ×512 gain factor is specific to the Aqara Camera E1's AAC-ELD output. Other cameras may need different gain values.
+4. **Audio gain tuning:** The default ×512 gain factor is tuned for the Aqara Camera E1's AAC-ELD output. Other cameras may need different values (configurable via `audio.gain`).
 
 5. **`mediacommon/v2` AAC-ELD bug:** The library cannot correctly encode AAC-ELD AudioSpecificConfig. A hardcoded hex string is used instead of computed SDP parameters.
 

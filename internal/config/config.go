@@ -41,6 +41,7 @@ type AudioConfig struct {
 	Enabled    bool   `yaml:"enabled"`
 	Codec      string `yaml:"codec"`
 	SampleRate int    `yaml:"sample_rate"`
+	Gain       *int   `yaml:"gain"` // PCM gain factor applied during AAC-ELD→AAC-LC transcoding (0 = mute, 512 = ~54dB)
 }
 
 type ONVIFConfig struct {
@@ -110,7 +111,12 @@ func applyDefaults(c *CameraConfig) {
 	if c.Audio.SampleRate == 0 {
 		c.Audio.SampleRate = 16000
 	}
+	if c.Audio.Gain == nil {
+		c.Audio.Gain = intPtr(512)
+	}
 	if c.ONVIF.Port == 0 {
 		c.ONVIF.Port = 8580
 	}
 }
+
+func intPtr(v int) *int { return &v }

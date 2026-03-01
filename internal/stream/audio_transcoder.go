@@ -125,6 +125,7 @@ import (
 // AAC-ELD uses 480 or 512 samples/frame; AAC-LC uses 1024. We accumulate
 // decoded PCM in a ring buffer and encode whenever we have a full LC frame.
 type AudioTranscoder struct {
+	gain int // PCM gain factor (0 = mute, 512 = ~54dB)
 	decoder C.HANDLE_AACDECODER
 	encoder C.HANDLE_AACENCODER
 	outASC  []byte  // AAC-LC AudioSpecificConfig from encoder
@@ -188,7 +189,7 @@ func eldASCCandidates(sampleRate int) []string {
 // NewAudioTranscoder creates a transcoder that decodes AAC-ELD and encodes AAC-LC.
 // It tries multiple ASC configurations to find one that works with the camera's
 // actual encoding format.
-func NewAudioTranscoder(sampleRate int, eldASCHex string) (*AudioTranscoder, error) {
+func NewAudioTranscoder(sampleRate int, eldASCHex string, gain int) (*AudioTranscoder, error) {
 	// Run a self-test to verify FDK-AAC's ELD encoder+decoder work on this platform.
 	selfTestELD(sampleRate)
 
@@ -204,6 +205,7 @@ func NewAudioTranscoder(sampleRate int, eldASCHex string) (*AudioTranscoder, err
 		return nil, fmt.Errorf("init transcoder with ASC %s: %w", asc, err)
 	}
 
+	t.gain = gain
 	t.sampleRate = sampleRate
 	t.detecting = false // no auto-detection
 
@@ -477,16 +479,17 @@ func (t *AudioTranscoder) transcodeFrame(aacELDFrame []byte) ([]byte, error) {
 
 	// Amplify decoded PCM. The camera's AAC-ELD decoder output is ~60 dB too
 	// quiet (maxPCM ~7 out of 32767). Apply gain to bring to normal levels.
-	// Gain of 1024 ≈ +60 dB. Clamp to int16 range to prevent clipping.
-	const pcmGain = 512
-	for i := 0; i < decoded; i++ {
-		v := int32(t.decBuf[i]) * pcmGain
-		if v > 32767 {
-			v = 32767
-		} else if v < -32768 {
-			v = -32768
+	// Clamp to int16 range to prevent clipping. Gain of 0 = passthrough.
+	if t.gain != 0 {
+		for i := 0; i < decoded; i++ {
+			v := int32(t.decBuf[i]) * int32(t.gain)
+			if v > 32767 {
+				v = 32767
+			} else if v < -32768 {
+				v = -32768
+			}
+			t.decBuf[i] = C.INT_PCM(v)
 		}
-		t.decBuf[i] = C.INT_PCM(v)
 	}
 
 	copy(t.pcmRing[t.pcmLen:], t.decBuf[:decoded])

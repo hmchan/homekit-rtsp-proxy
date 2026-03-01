@@ -96,10 +96,22 @@ cameras:
       enabled: true
       codec: "aac-eld"               # "aac-eld" or "opus"
       sample_rate: 16000
+      gain: 512                      # PCM gain for transcoding (0 = passthrough, default 512 ≈ 54dB)
     onvif:
       enabled: true
       port: 8580
 ```
+
+### Logging
+
+All logs are written to **stdout** using Go's structured `slog` package. Control verbosity with `log_level` in the config file:
+
+- `debug` -- verbose protocol details, RTP packet counts, HAP characteristic dumps
+- `info` -- connection events, stream start/stop, motion events (default)
+- `warn` -- recoverable errors, non-fatal stream issues
+- `error` -- fatal failures
+
+Use your process manager (systemd, Docker, etc.) to capture and rotate logs as needed.
 
 ### Finding your camera's name
 
@@ -226,7 +238,7 @@ go build -o test-rtsp ./cmd/test-rtsp/
 - **AAC-ELD only tested:** Opus codec negotiation is implemented but untested. Aqara Camera E1 rejects Opus.
 - **Single stream per camera:** Uses one of the camera's limited concurrent stream slots.
 - **No automatic stream recovery:** If the camera drops the SRTP stream, the RTSP client must reconnect.
-- **Audio gain is hardcoded:** The 54dB gain compensation is tuned for Aqara Camera E1. Other cameras may need adjustment.
+- **Audio gain may need tuning:** The default gain of 512 (~54dB) compensates for quiet AAC-ELD output on some cameras. Set `gain: 0` to disable amplification.
 - **No talkback:** Silence packets satisfy the protocol, but real two-way audio is not implemented.
 
 ## Tested Cameras

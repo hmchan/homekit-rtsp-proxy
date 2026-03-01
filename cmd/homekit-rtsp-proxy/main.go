@@ -217,6 +217,7 @@ func main() {
 			HasAudio:   cam.Audio.Enabled,
 			AudioCodec: cam.Audio.Codec,
 			SampleRate: cam.Audio.SampleRate,
+			AudioGain:  *cam.Audio.Gain,
 		}, session, camLogger)
 
 		// Wire SRTP proxy output to RTSP server.
