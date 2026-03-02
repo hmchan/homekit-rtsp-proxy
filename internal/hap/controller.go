@@ -276,8 +276,115 @@ func (c *Controller) readControllerKeys() (controllerID string, ltsk ed25519.Pri
 	return controllerID, ed25519.PrivateKey(kp.Private), ed25519.PublicKey(kp.Public), nil
 }
 
+// reconnect re-establishes the HAP pair-verify session for a camera whose
+// TCP connection has dropped (broken pipe, EOF, etc.). It discovers the
+// camera's current address via mDNS, performs pair-verify, and re-fetches
+// the accessory database to update characteristic IIDs.
+func (c *Controller) reconnect(deviceName string) error {
+	c.logger.Info("reconnecting to camera", "name", deviceName)
+
+	controllerID, controllerLTSK, controllerLTPK, err := c.readControllerKeys()
+	if err != nil {
+		return fmt.Errorf("read controller keys: %w", err)
+	}
+
+	c.mu.Lock()
+	device, ok := c.devices[deviceName]
+	c.mu.Unlock()
+	if !ok {
+		device = c.controller.GetDevice(deviceName)
+		if device == nil {
+			return fmt.Errorf("device %q not found via mDNS", deviceName)
+		}
+	}
+
+	pairingInfo := device.GetPairingInfo()
+	if len(pairingInfo.PublicKey) == 0 {
+		return fmt.Errorf("no accessory public key for %q", deviceName)
+	}
+
+	entry := device.GetDnssdEntry()
+	if len(entry.IPs) == 0 {
+		return fmt.Errorf("no IPs known for %q", deviceName)
+	}
+
+	var deviceAddr string
+	for _, ip := range entry.IPs {
+		if ip.To4() != nil {
+			deviceAddr = fmt.Sprintf("%s:%d", ip.String(), entry.Port)
+			break
+		}
+	}
+	if deviceAddr == "" {
+		deviceAddr = fmt.Sprintf("[%s]:%d", entry.IPs[0].String(), entry.Port)
+	}
+
+	c.logger.Info("performing pair-verify (reconnect)", "name", deviceName, "addr", deviceAddr)
+
+	var vc *VerifiedConn
+	var verifyErr error
+	for attempt := 1; attempt <= 3; attempt++ {
+		vc, verifyErr = DoPairVerify(deviceAddr, controllerID, controllerLTSK, controllerLTPK, pairingInfo.PublicKey)
+		if verifyErr == nil {
+			break
+		}
+		c.logger.Warn("pair-verify attempt failed (reconnect)", "name", deviceName, "attempt", attempt, "error", verifyErr)
+		time.Sleep(time.Duration(attempt) * time.Second)
+	}
+	if verifyErr != nil {
+		return fmt.Errorf("pair verify: %w", verifyErr)
+	}
+
+	c.logger.Info("fetching accessory database (reconnect)", "name", deviceName)
+	accessories, err := vc.Client.GetAccessories()
+	if err != nil {
+		vc.Client.Close()
+		return fmt.Errorf("get accessories: %w", err)
+	}
+
+	ids, err := findCameraCharIDs(accessories)
+	if err != nil {
+		vc.Client.Close()
+		return fmt.Errorf("find camera characteristics: %w", err)
+	}
+
+	c.mu.Lock()
+	c.verified[deviceName] = vc
+	c.charIDs[deviceName] = ids
+	c.mu.Unlock()
+
+	c.logger.Info("camera reconnected", "name", deviceName)
+	return nil
+}
+
+// isConnError returns true if the error indicates a broken TCP connection
+// (broken pipe, connection reset, EOF) that warrants a reconnect.
+func isConnError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "broken pipe") ||
+		strings.Contains(s, "connection reset") ||
+		strings.Contains(s, "EOF") ||
+		strings.Contains(s, "use of closed network connection")
+}
+
 // StartStream initiates a camera stream and returns the stream response.
+// If the HAP connection is broken, it automatically reconnects and retries once.
 func (c *Controller) StartStream(ctx context.Context, deviceName string, localIP net.IP, videoPort, audioPort uint16, videoConfig VideoSelection, audioConfig AudioSelection) (*StreamResponse, error) {
+	resp, err := c.doStartStream(ctx, deviceName, localIP, videoPort, audioPort, videoConfig, audioConfig)
+	if err != nil && isConnError(err) {
+		c.logger.Warn("stream start failed with connection error, reconnecting", "name", deviceName, "error", err)
+		if reconErr := c.reconnect(deviceName); reconErr != nil {
+			return nil, fmt.Errorf("reconnect failed: %w (original: %v)", reconErr, err)
+		}
+		return c.doStartStream(ctx, deviceName, localIP, videoPort, audioPort, videoConfig, audioConfig)
+	}
+	return resp, err
+}
+
+func (c *Controller) doStartStream(ctx context.Context, deviceName string, localIP net.IP, videoPort, audioPort uint16, videoConfig VideoSelection, audioConfig AudioSelection) (*StreamResponse, error) {
 	c.mu.Lock()
 	vc := c.verified[deviceName]
 	ids := c.charIDs[deviceName]
