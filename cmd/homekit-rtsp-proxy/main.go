@@ -101,6 +101,7 @@ func main() {
 	}
 
 	type cameraServices struct {
+		name       string
 		rtspServer *stream.RTSPServer
 		onvifSrv   *onvif.Server
 		srtpProxy  *stream.SRTPProxy
@@ -241,6 +242,7 @@ func main() {
 		camLogger.Info("RTSP URL available", "url", rtspURL)
 
 		svc := cameraServices{
+			name:       cam.Name,
 			rtspServer: rtspServer,
 			srtpProxy:  srtpProxy,
 			session:    session,
@@ -280,6 +282,23 @@ func main() {
 
 		services = append(services, svc)
 	}
+
+	// Restart any active stream after the controller auto-recovers a
+	// camera (e.g. after a camera reboot). The reconnect itself only
+	// re-pair-verifies and re-subscribes motion; SRTP needs a fresh
+	// SetupEndpoints to resume packet flow.
+	controller.SetRecoveredCallback(func(deviceName string) {
+		for _, svc := range services {
+			if svc.name != deviceName {
+				continue
+			}
+			if err := svc.session.Restart(); err != nil {
+				logger.Error("session restart after recovery failed",
+					"camera", deviceName, "error", err)
+			}
+			return
+		}
+	})
 
 	logger.Info("all cameras ready, waiting for RTSP clients")
 

@@ -183,6 +183,55 @@ func (s *Session) stopLocked() error {
 	return nil
 }
 
+// Restart drives onStop followed by onStart while preserving the current
+// client count. Used after a HAP auto-recovery so the stream picks up the
+// fresh session and SRTP keys without disturbing connected RTSP clients
+// (whose seq/ts continuity is maintained by the RTSP server's own state).
+func (s *Session) Restart() error {
+	s.mu.Lock()
+	if s.state != StateStreaming {
+		s.mu.Unlock()
+		return nil
+	}
+
+	if s.stopTimer != nil {
+		s.stopTimer.Stop()
+		s.stopTimer = nil
+	}
+
+	clients := s.clientCount
+	s.state = StateStopping
+	s.mu.Unlock()
+
+	if err := s.onStop(); err != nil {
+		// onStop talking to a freshly rebooted camera will often fail
+		// (session ID is gone) — that's expected, keep going.
+		s.logger.Warn("onStop during restart (continuing)",
+			"camera", s.cameraName, "error", err)
+	}
+
+	s.mu.Lock()
+	s.state = StateStarting
+	s.mu.Unlock()
+
+	if err := s.onStart(); err != nil {
+		s.mu.Lock()
+		s.state = StateIdle
+		s.clientCount = 0
+		s.mu.Unlock()
+		return fmt.Errorf("onStart during restart: %w", err)
+	}
+
+	s.mu.Lock()
+	s.state = StateStreaming
+	s.clientCount = clients
+	s.mu.Unlock()
+
+	s.logger.Info("session restarted after recovery",
+		"camera", s.cameraName, "clients", clients)
+	return nil
+}
+
 // Shutdown cancels any pending warm-stop timer and stops the stream
 // synchronously if it is still running. Safe to call when already idle.
 func (s *Session) Shutdown() error {

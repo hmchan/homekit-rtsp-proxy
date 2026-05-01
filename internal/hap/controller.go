@@ -59,6 +59,11 @@ type Controller struct {
 	motionCtx       context.Context       // context for motion subscriptions
 	controller      *hkontroller.Controller
 	cancelFunc      context.CancelFunc
+
+	// recoveredCallback is fired after a successful auto-recovery (e.g. after
+	// a camera reboot). main.go uses it to restart any active stream so the
+	// new HAP session and fresh SRTP keys take effect.
+	recoveredCallback func(deviceName string)
 }
 
 // NewController creates a new HAP controller.
@@ -96,24 +101,99 @@ func (c *Controller) Start(ctx context.Context) error {
 	c.cancelFunc = cancel
 
 	discoverCh, lostCh := ctrl.StartDiscoveryWithContext(dctx)
+	go c.discoveryLoop(dctx, discoverCh, lostCh)
 
-	// Handle discovered devices in background.
-	go func() {
-		for device := range discoverCh {
-			c.logger.Info("device discovered", "name", device.Name, "paired", device.IsPaired())
+	return nil
+}
+
+// SetRecoveredCallback registers a function to be called after a successful
+// auto-recovery (post-reconnect of a previously-lost device). main.go uses
+// this to restart any active stream so the fresh HAP session/SRTP keys
+// drive new packets without disturbing connected RTSP clients.
+func (c *Controller) SetRecoveredCallback(cb func(deviceName string)) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.recoveredCallback = cb
+}
+
+// discoveryLoop merges the discover/lost channels so we can track which
+// devices are currently lost and trigger an auto-recovery the moment a
+// paired device reappears (typical pattern for a camera reboot).
+func (c *Controller) discoveryLoop(ctx context.Context, discoverCh, lostCh <-chan *hkontroller.Device) {
+	lost := make(map[string]bool)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case device, ok := <-discoverCh:
+			if !ok {
+				discoverCh = nil
+				if lostCh == nil {
+					return
+				}
+				continue
+			}
+			wasLost := lost[device.Name]
+			delete(lost, device.Name)
 			c.mu.Lock()
 			c.devices[device.Name] = device
 			c.mu.Unlock()
-		}
-	}()
-
-	go func() {
-		for device := range lostCh {
+			c.logger.Info("device discovered",
+				"name", device.Name,
+				"paired", device.IsPaired(),
+				"wasLost", wasLost)
+			if wasLost && device.IsPaired() {
+				go c.recoverDevice(ctx, device.Name)
+			}
+		case device, ok := <-lostCh:
+			if !ok {
+				lostCh = nil
+				if discoverCh == nil {
+					return
+				}
+				continue
+			}
 			c.logger.Warn("device lost", "name", device.Name)
+			lost[device.Name] = true
 		}
-	}()
+	}
+}
 
-	return nil
+// recoverDevice re-establishes the HAP session for a device that was
+// rediscovered after being lost (most commonly after a camera reboot).
+// It retries with backoff to handle the camera still booting, then fires
+// the registered recovered callback so any in-flight stream can be
+// restarted with new SRTP keys.
+func (c *Controller) recoverDevice(ctx context.Context, deviceName string) {
+	// Long enough to span a typical camera boot (~30–60s) without being
+	// excessive. After exhaustion we wait for the next mDNS lost/rediscover
+	// cycle to trigger another attempt.
+	backoff := []time.Duration{0, 5 * time.Second, 15 * time.Second, 30 * time.Second, 60 * time.Second}
+	for i, wait := range backoff {
+		if wait > 0 {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(wait):
+			}
+		}
+		c.logger.Info("auto-recovery attempt", "name", deviceName, "attempt", i+1)
+		if err := c.reconnect(deviceName); err != nil {
+			c.logger.Warn("auto-recovery attempt failed",
+				"name", deviceName, "attempt", i+1, "error", err)
+			continue
+		}
+		c.logger.Info("auto-recovery succeeded", "name", deviceName)
+		c.mu.Lock()
+		cb := c.recoveredCallback
+		c.mu.Unlock()
+		if cb != nil {
+			cb(deviceName)
+		}
+		return
+	}
+	c.logger.Error("auto-recovery exhausted; waiting for next mDNS event",
+		"name", deviceName)
 }
 
 // PairCamera pairs with a camera using its setup code, then performs pair-verify
