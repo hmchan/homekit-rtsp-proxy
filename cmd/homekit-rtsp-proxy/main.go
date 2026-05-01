@@ -104,6 +104,7 @@ func main() {
 		rtspServer *stream.RTSPServer
 		onvifSrv   *onvif.Server
 		srtpProxy  *stream.SRTPProxy
+		session    *stream.Session
 	}
 
 	var services []cameraServices
@@ -122,7 +123,7 @@ func main() {
 		// Create on-demand session. We declare it first so closures can reference it.
 		localIP := net.ParseIP(bindAddr)
 		var session *stream.Session
-		session = stream.NewSession(cam.Name, camLogger,
+		session = stream.NewSession(cam.Name, cam.RTSP.IdleTimeout, camLogger,
 			// onStart: called when first RTSP client connects.
 			func() error {
 				camLogger.Info("starting camera stream")
@@ -234,6 +235,7 @@ func main() {
 		svc := cameraServices{
 			rtspServer: rtspServer,
 			srtpProxy:  srtpProxy,
+			session:    session,
 		}
 
 		// Set up ONVIF server if enabled.
@@ -282,6 +284,12 @@ func main() {
 	for _, svc := range services {
 		if svc.onvifSrv != nil {
 			svc.onvifSrv.Stop()
+		}
+		// Stop the camera stream cleanly first (cancels any warm-mode timer
+		// and tells the camera to end the HAP session) before tearing down
+		// the SRTP proxy that the onStop callback uses.
+		if err := svc.session.Shutdown(); err != nil {
+			logger.Warn("session shutdown error", "error", err)
 		}
 		svc.rtspServer.Stop()
 		svc.srtpProxy.Close()

@@ -11,6 +11,9 @@ cameras:
     rtsp:
       port: 8554                   # RTSP server port for this camera
       path: "/live"                # RTSP stream path
+      idle_timeout: 30s            # Keep camera streaming this long after the last RTSP client disconnects.
+                                   # Reconnects within this window skip the HAP/encoder startup (~1s+).
+                                   # 0 (or omit) = stop immediately on last disconnect.
     video:
       width: 1920
       height: 1080

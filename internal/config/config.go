@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -26,8 +27,9 @@ type CameraConfig struct {
 }
 
 type RTSPConfig struct {
-	Port int    `yaml:"port"`
-	Path string `yaml:"path"`
+	Port        int           `yaml:"port"`
+	Path        string        `yaml:"path"`
+	IdleTimeout time.Duration `yaml:"idle_timeout"` // Keep camera streaming this long after the last RTSP client disconnects (0 = stop immediately).
 }
 
 type VideoConfig struct {

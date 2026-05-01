@@ -19,3 +19,7 @@ Thumbs.db
 
 # Docker build context (large cached modules)
 vendor/
+
+# Local agent / private notes (may contain host-specific or deployment details)
+.claude/
+CLAUDE.md
