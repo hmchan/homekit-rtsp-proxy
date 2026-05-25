@@ -225,6 +225,8 @@ func main() {
 
 		// Wire SRTP proxy output to RTSP server.
 		srtpProxy.SetCallbacks(rtspServer.WriteVideoPacket, rtspServer.WriteAudioPacket)
+		// Best-effort IDR caching for gapped frames (heavy WiFi packet loss).
+		srtpProxy.SetIDRCallback(rtspServer.CacheOnlyVideoPacket)
 
 		if err := rtspServer.Start(); err != nil {
 			camLogger.Error("failed to start RTSP server", "error", err)

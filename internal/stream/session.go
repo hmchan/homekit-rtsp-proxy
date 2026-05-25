@@ -53,6 +53,12 @@ type Session struct {
 	// cost again. Zero disables warm mode.
 	idleTimeout time.Duration
 	stopTimer   *time.Timer
+
+	// stopDone is created when entering StateStopping and closed when the
+	// state returns to Idle (or transitions to Starting in Restart). Clients
+	// that arrive during StateStopping wait on this channel and retry rather
+	// than failing immediately.
+	stopDone chan struct{}
 }
 
 func NewSession(cameraName string, idleTimeout time.Duration, logger *slog.Logger, onStart, onStop func() error) *Session {
@@ -69,46 +75,77 @@ func NewSession(cameraName string, idleTimeout time.Duration, logger *slog.Logge
 // ClientConnected is called when an RTSP client starts playing.
 // Returns (freshStart, error): freshStart is true if this call triggered the
 // camera to start (first client), false if the camera was already streaming.
+//
+// If the stream is currently stopping (StateStopping), this method blocks
+// until the stop completes (up to 20 seconds) and then retries, so callers
+// never see a spurious "cannot start in state stopping" error.
 func (s *Session) ClientConnected() (bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	for {
+		s.mu.Lock()
 
-	// Cancel any pending warm-mode stop. If Stop() returns false the timer
-	// already fired; the callback is serialized on s.mu and will run after
-	// this method returns, so we still need to decide based on current state.
-	if s.stopTimer != nil {
-		s.stopTimer.Stop()
-		s.stopTimer = nil
+		// Cancel any pending warm-mode stop. If Stop() returns false the timer
+		// already fired; the callback is serialized on s.mu and will run after
+		// this lock is released, so we still need to decide based on current state.
+		if s.stopTimer != nil {
+			s.stopTimer.Stop()
+			s.stopTimer = nil
+		}
+
+		switch s.state {
+		case StateStreaming, StateStarting:
+			// Stream already running — attach this client and return immediately.
+			s.clientCount++
+			s.logger.Info("RTSP client connected",
+				"camera", s.cameraName,
+				"clients", s.clientCount,
+				"state", s.state)
+			s.mu.Unlock()
+			return false, nil
+
+		case StateStopping:
+			// A previous stop is in progress (e.g. broken HAP pipe). Rather than
+			// failing immediately — which would leak clientCount — wait for it to
+			// finish and retry. clientCount is NOT incremented until we succeed.
+			done := s.stopDone
+			s.logger.Info("RTSP client waiting for in-progress stop",
+				"camera", s.cameraName)
+			s.mu.Unlock()
+			select {
+			case <-done:
+				// Stop finished; loop and try again.
+			case <-time.After(20 * time.Second):
+				return false, fmt.Errorf("timeout waiting for stream to stop before starting")
+			}
+			continue
+
+		case StateIdle:
+			// First client — we will start the stream below.
+			s.clientCount++
+			s.logger.Info("RTSP client connected",
+				"camera", s.cameraName,
+				"clients", s.clientCount,
+				"state", s.state)
+			s.state = StateStarting
+			s.mu.Unlock()
+
+			err := s.onStart()
+
+			s.mu.Lock()
+			if err != nil {
+				s.state = StateIdle
+				s.clientCount--
+				s.mu.Unlock()
+				return false, fmt.Errorf("start stream: %w", err)
+			}
+			s.state = StateStreaming
+			s.mu.Unlock()
+			return true, nil
+
+		default:
+			s.mu.Unlock()
+			return false, fmt.Errorf("cannot start stream in state %s", s.state)
+		}
 	}
-
-	s.clientCount++
-	s.logger.Info("RTSP client connected",
-		"camera", s.cameraName,
-		"clients", s.clientCount,
-		"state", s.state)
-
-	if s.state == StateStreaming || s.state == StateStarting {
-		return false, nil
-	}
-
-	if s.state != StateIdle {
-		return false, fmt.Errorf("cannot start stream in state %s", s.state)
-	}
-
-	s.state = StateStarting
-	s.mu.Unlock()
-
-	err := s.onStart()
-
-	s.mu.Lock()
-	if err != nil {
-		s.state = StateIdle
-		s.clientCount--
-		return false, fmt.Errorf("start stream: %w", err)
-	}
-
-	s.state = StateStreaming
-	return true, nil
 }
 
 // ClientDisconnected is called when an RTSP client disconnects.
@@ -169,14 +206,21 @@ func (s *Session) idleTimerFired() {
 
 // stopLocked runs onStop and transitions the state machine. Caller must
 // hold s.mu; the lock is briefly released around the user callback.
+// It creates stopDone before releasing the lock and closes it after
+// the state returns to Idle, so ClientConnected callers waiting on
+// StateStopping are unblocked as soon as the stop completes.
 func (s *Session) stopLocked() error {
 	s.state = StateStopping
+	done := make(chan struct{})
+	s.stopDone = done
 	s.mu.Unlock()
 
 	err := s.onStop()
 
 	s.mu.Lock()
 	s.state = StateIdle
+	s.stopDone = nil
+	close(done)
 	if err != nil {
 		return fmt.Errorf("stop stream: %w", err)
 	}
@@ -201,6 +245,8 @@ func (s *Session) Restart() error {
 
 	clients := s.clientCount
 	s.state = StateStopping
+	done := make(chan struct{})
+	s.stopDone = done
 	s.mu.Unlock()
 
 	if err := s.onStop(); err != nil {
@@ -211,6 +257,8 @@ func (s *Session) Restart() error {
 	}
 
 	s.mu.Lock()
+	s.stopDone = nil
+	close(done)
 	s.state = StateStarting
 	s.mu.Unlock()
 

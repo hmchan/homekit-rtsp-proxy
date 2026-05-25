@@ -353,6 +353,21 @@ func (s *RTSPServer) normalizeVideoRTP(pkt *rtp.Packet) {
 	s.lastVideoTime = time.Now()
 }
 
+// CacheOnlyVideoPacket receives an H.264 RTP packet for IDR cache purposes only,
+// without forwarding it to RTSP clients. Used for gapped IDR frames: the packet
+// sequence gaps make them unsafe for live streaming but the payload is still
+// valid for populating the IDR cache so late-joining clients can start playing.
+// The IDR injection path re-assigns sequence numbers and timestamps at play time,
+// so gaps in the cached packets don't corrupt the re-sent IDR.
+func (s *RTSPServer) CacheOnlyVideoPacket(pkt *rtp.Packet) {
+	// Extract SPS/PPS from STAP-A if not yet seen — needed for snapshot JPEG.
+	if !s.gotParams {
+		s.extractSPSPPS(pkt.Payload)
+	}
+	// cacheIDRPacket acquires idrMu internally.
+	s.cacheIDRPacket(pkt)
+}
+
 // WriteVideoPacket writes a decrypted H.264 RTP packet to all connected clients.
 func (s *RTSPServer) WriteVideoPacket(pkt *rtp.Packet) {
 	s.mu.Lock()
@@ -598,6 +613,7 @@ func (s *RTSPServer) OnPlay(ctx *gortsplib.ServerHandlerOnPlayCtx) (*base.Respon
 	// the camera synchronously (~170ms HAP exchange), the first RTP packets
 	// (STAP-A with SPS/PPS + IDR frame) arrive before the reader is
 	// registered and get silently dropped.
+	rtspSession := ctx.Session
 	go func() {
 		// Wait for gortsplib to finish initializing the TCP writer.
 		// The writer is started asynchronously after the PLAY response is sent.
@@ -606,6 +622,7 @@ func (s *RTSPServer) OnPlay(ctx *gortsplib.ServerHandlerOnPlayCtx) (*base.Respon
 		freshStart, err := s.session.ClientConnected()
 		if err != nil {
 			s.logger.Error("failed to start stream for client", "error", err)
+			rtspSession.Close()
 			return
 		}
 
@@ -618,7 +635,12 @@ func (s *RTSPServer) OnPlay(ctx *gortsplib.ServerHandlerOnPlayCtx) (*base.Respon
 		select {
 		case <-s.idrReady:
 		case <-time.After(10 * time.Second):
-			s.logger.Warn("timeout waiting for IDR cache in OnPlay")
+			// No IDR arrived in time (likely heavy packet loss dropped all
+			// keyframes). Close the RTSP session so the client reconnects and
+			// triggers a proper ClientDisconnected cleanup, rather than leaving
+			// a zombie client that never receives video.
+			s.logger.Warn("timeout waiting for IDR cache in OnPlay, closing client session")
+			rtspSession.Close()
 			return
 		}
 

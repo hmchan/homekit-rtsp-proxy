@@ -51,6 +51,10 @@ type SRTPProxy struct {
 	// Callbacks for forwarding decrypted packets.
 	onVideoRTP func(*rtp.Packet)
 	onAudioRTP func(*rtp.Packet)
+	// onIDRRTP is called for IDR frames even when they are gapped (incomplete),
+	// so the IDR cache can be populated for late-joining clients without
+	// forwarding corrupt data to existing RTSP clients.
+	onIDRRTP func(*rtp.Packet)
 
 	stopCh chan struct{}
 	wg     sync.WaitGroup
@@ -89,6 +93,14 @@ func NewSRTPProxy(logger *slog.Logger) *SRTPProxy {
 func (p *SRTPProxy) SetCallbacks(onVideo, onAudio func(*rtp.Packet)) {
 	p.onVideoRTP = onVideo
 	p.onAudioRTP = onAudio
+}
+
+// SetIDRCallback sets a cache-only callback invoked for IDR frames that were
+// dropped from the normal forwarding path due to sequence gaps. This lets the
+// IDR cache be populated even during heavy packet loss so new clients can start
+// playing, without sending incomplete frames to existing RTSP clients.
+func (p *SRTPProxy) SetIDRCallback(onIDR func(*rtp.Packet)) {
+	p.onIDRRTP = onIDR
 }
 
 // OpenPorts opens UDP listeners on the specified ports (or random ports if 0).
@@ -299,6 +311,16 @@ func (p *SRTPProxy) readVideoLoop() {
 					p.onVideoRTP(fp)
 				}
 			} else if frameGapped {
+				// Best-effort IDR caching: even when the IDR access unit has
+				// missing packets, forward it to the cache-only path so
+				// idrReady fires and clients can start connecting. The injection
+				// code re-assigns seq/ts at play time so gaps don't corrupt the
+				// re-sent IDR. Non-IDR gapped frames are still discarded.
+				if p.onIDRRTP != nil && isIDRFrame(frameBuf) {
+					for _, fp := range frameBuf {
+						p.onIDRRTP(fp)
+					}
+				}
 				droppedFrames++
 			}
 			frameBuf = frameBuf[:0]
@@ -329,6 +351,11 @@ func (p *SRTPProxy) readVideoLoop() {
 					p.onVideoRTP(fp)
 				}
 			} else if frameGapped {
+				if p.onIDRRTP != nil && isIDRFrame(frameBuf) {
+					for _, fp := range frameBuf {
+						p.onIDRRTP(fp)
+					}
+				}
 				droppedFrames++
 			}
 			frameBuf = frameBuf[:0]
@@ -348,6 +375,16 @@ func (p *SRTPProxy) readVideoLoop() {
 			lastLogTime = time.Now()
 		}
 	}
+}
+
+// isIDRFrame returns true if frameBuf begins with a STAP-A packet (naluType 24),
+// which is how the camera opens every IDR access unit (SPS+PPS bundled together).
+// Used to decide whether to forward a gapped frame to the IDR cache.
+func isIDRFrame(frameBuf []*rtp.Packet) bool {
+	if len(frameBuf) == 0 || len(frameBuf[0].Payload) < 1 {
+		return false
+	}
+	return frameBuf[0].Payload[0]&0x1F == 24 // STAP-A
 }
 
 // isFrameStart checks if an RTP payload begins a new H.264 access unit.
