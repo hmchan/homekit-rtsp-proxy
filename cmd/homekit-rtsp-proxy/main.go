@@ -45,7 +45,16 @@ func main() {
 	case "error":
 		logLevel = slog.LevelError
 	}
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel}))
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+		Level: logLevel,
+		ReplaceAttr: func(_ []string, a slog.Attr) slog.Attr {
+			// Always format timestamps in UTC regardless of host timezone.
+			if a.Key == slog.TimeKey {
+				a.Value = slog.StringValue(a.Value.Time().UTC().Format(time.RFC3339Nano))
+			}
+			return a
+		},
+	}))
 
 	// Load pairing store.
 	store, err := hap.NewPairingStore(cfg.PairingStore)
