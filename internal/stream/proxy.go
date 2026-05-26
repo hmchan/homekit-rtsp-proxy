@@ -129,6 +129,10 @@ func (p *SRTPProxy) OpenPorts(videoPort, audioPort int) (int, int, error) {
 	var err error
 
 	p.stopCh = make(chan struct{})
+	// Reset stall timer so the watchdog waits for the first packet in the new
+	// session rather than firing immediately based on the previous session's
+	// stale timestamp.
+	p.lastVideoNanos.Store(0)
 
 	p.videoConn, err = net.ListenUDP("udp4", &net.UDPAddr{Port: videoPort})
 	if err != nil {
@@ -667,13 +671,17 @@ func (p *SRTPProxy) videoWatchdogLoop() {
 			if since > p.videoStallTimeout {
 				p.logger.Warn("video stall detected, triggering session restart",
 					"stall_duration", since.Round(time.Second),
-					"threshold", p.videoStallTimeout)
+					"threshold", p.videoStallTimeout,
+					"last_video_ago_s", since.Seconds())
 				// Fire async: the callback typically calls session.Restart() →
 				// onStop() → srtpProxy.Close() → wg.Wait(). Running it inline
 				// would deadlock because this goroutine is still counted by wg.
 				go p.onVideoStall()
 				return
 			}
+			p.logger.Debug("video watchdog tick",
+				"since_last_video_s", since.Seconds(),
+				"threshold_s", p.videoStallTimeout.Seconds())
 		}
 	}
 }
