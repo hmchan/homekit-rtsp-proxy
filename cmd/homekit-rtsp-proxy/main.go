@@ -227,6 +227,14 @@ func main() {
 		srtpProxy.SetCallbacks(rtspServer.WriteVideoPacket, rtspServer.WriteAudioPacket)
 		// Best-effort IDR caching for gapped frames (heavy WiFi packet loss).
 		srtpProxy.SetIDRCallback(rtspServer.CacheOnlyVideoPacket)
+		// Video stall watchdog: restart the session if the camera stops sending
+		// video for 30 s without closing the HAP connection (observed in the wild).
+		srtpProxy.SetVideoStallCallback(30*time.Second, func() {
+			camLogger.Warn("video stall watchdog triggered, restarting session")
+			if err := session.Restart(); err != nil {
+				camLogger.Error("session restart after video stall failed", "error", err)
+			}
+		})
 
 		if err := rtspServer.Start(); err != nil {
 			camLogger.Error("failed to start RTSP server", "error", err)

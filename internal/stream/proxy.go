@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pion/rtcp"
@@ -56,6 +57,13 @@ type SRTPProxy struct {
 	// forwarding corrupt data to existing RTSP clients.
 	onIDRRTP func(*rtp.Packet)
 
+	// Video stall detection: if no video packet arrives within videoStallTimeout
+	// after the first packet, onVideoStall is called in a new goroutine.
+	// The callback typically calls session.Restart() to re-establish the stream.
+	lastVideoNanos    atomic.Int64  // unix nanos of last video packet; 0 = none yet
+	videoStallTimeout time.Duration // 0 = disabled
+	onVideoStall      func()        // fired async when stall is detected
+
 	stopCh chan struct{}
 	wg     sync.WaitGroup
 }
@@ -101,6 +109,18 @@ func (p *SRTPProxy) SetCallbacks(onVideo, onAudio func(*rtp.Packet)) {
 // playing, without sending incomplete frames to existing RTSP clients.
 func (p *SRTPProxy) SetIDRCallback(onIDR func(*rtp.Packet)) {
 	p.onIDRRTP = onIDR
+}
+
+// SetVideoStallCallback configures a watchdog that fires onStall (in a new
+// goroutine) when no video packet is received for stallTimeout after the first
+// packet arrives. Typically wired to session.Restart() to recover a camera
+// that has stopped sending video without closing the HAP connection.
+// The callback is fired at most once per proxy lifetime; the watchdog exits
+// after triggering so it does not interfere with the subsequent restart.
+// Call before Start().
+func (p *SRTPProxy) SetVideoStallCallback(stallTimeout time.Duration, onStall func()) {
+	p.videoStallTimeout = stallTimeout
+	p.onVideoStall = onStall
 }
 
 // OpenPorts opens UDP listeners on the specified ports (or random ports if 0).
@@ -200,6 +220,11 @@ func (p *SRTPProxy) Start(cfg SRTPConfig) error {
 	go p.rtcpKeepaliveLoop()
 	go p.audioReturnLoop()
 
+	if p.videoStallTimeout > 0 && p.onVideoStall != nil {
+		p.wg.Add(1)
+		go p.videoWatchdogLoop()
+	}
+
 	p.logger.Info("SRTP proxy started",
 		"video_port", p.videoConn.LocalAddr().(*net.UDPAddr).Port,
 		"audio_port", p.audioConn.LocalAddr().(*net.UDPAddr).Port,
@@ -270,6 +295,7 @@ func (p *SRTPProxy) readVideoLoop() {
 		}
 
 		videoCount++
+		p.lastVideoNanos.Store(time.Now().UnixNano())
 
 		// Track camera's actual SSRC and highest seq.
 		if videoCount == 1 {
@@ -608,6 +634,48 @@ func (p *SRTPProxy) sendAudioReturn(payload []byte) {
 	}
 
 	p.audioConn.WriteToUDP(encrypted, p.cameraAudioAddr)
+}
+
+// videoWatchdogLoop monitors the time since the last video RTP packet.
+// If no video arrives within videoStallTimeout after the first packet is seen,
+// it calls onVideoStall in a new goroutine (to avoid deadlocking with
+// Close()/wg.Wait() if the callback triggers a Restart that calls Close()).
+// The watchdog exits after firing once so it does not re-trigger during the
+// ensuing restart.
+func (p *SRTPProxy) videoWatchdogLoop() {
+	defer p.wg.Done()
+
+	// Poll at half the stall threshold so detection latency ≤ 1.5× threshold.
+	interval := p.videoStallTimeout / 2
+	if interval < time.Second {
+		interval = time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-p.stopCh:
+			return
+		case <-ticker.C:
+			t := p.lastVideoNanos.Load()
+			if t == 0 {
+				// No video packet received yet — do not arm the watchdog.
+				continue
+			}
+			since := time.Since(time.Unix(0, t))
+			if since > p.videoStallTimeout {
+				p.logger.Warn("video stall detected, triggering session restart",
+					"stall_duration", since.Round(time.Second),
+					"threshold", p.videoStallTimeout)
+				// Fire async: the callback typically calls session.Restart() →
+				// onStop() → srtpProxy.Close() → wg.Wait(). Running it inline
+				// would deadlock because this goroutine is still counted by wg.
+				go p.onVideoStall()
+				return
+			}
+		}
+	}
 }
 
 // Close stops the proxy and releases resources.
