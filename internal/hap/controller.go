@@ -79,28 +79,69 @@ func NewController(store *PairingStore, logger *slog.Logger) *Controller {
 	}
 }
 
-// GetCameraIP returns the IPv4 address the camera was discovered at via mDNS.
-// Returned IP is suitable for computing which local interface routes to the
-// camera, so multiple cameras on different VLANs each get the correct local
-// source address for their SRTP return path.
+// GetCameraIP returns the camera's IPv4 address, suitable for computing
+// which local interface routes to it.
+//
+// It prefers the remote address of the verified HAP connection: unlike the
+// mDNS cache it cannot go stale — dnssd entries lose their IPs when records
+// expire between announcements, and a camera that reboots before its old
+// record expires re-registers under a renamed instance ("Name (2)"), leaving
+// the configured name permanently IP-less. Streaming must not depend on the
+// mDNS cache once a connection exists.
 func (c *Controller) GetCameraIP(deviceName string) (net.IP, error) {
 	c.mu.Lock()
-	device, ok := c.devices[deviceName]
+	vc := c.verified[deviceName]
 	c.mu.Unlock()
-	if !ok {
-		device = c.controller.GetDevice(deviceName)
-		if device == nil {
-			return nil, fmt.Errorf("device %q not found via mDNS", deviceName)
+
+	// A closed TCP conn still reports its cached RemoteAddr, which is the
+	// right answer for routing: the upcoming StartStream will detect the
+	// dead conn and reconnect, and cameras keep their IP across reboots.
+	if vc != nil && vc.Conn != nil {
+		if addr, ok := vc.Conn.RemoteAddr().(*net.TCPAddr); ok {
+			if ip4 := addr.IP.To4(); ip4 != nil {
+				return ip4, nil
+			}
 		}
 	}
 
-	entry := device.GetDnssdEntry()
-	for _, ip := range entry.IPs {
-		if ip4 := ip.To4(); ip4 != nil {
-			return ip4, nil
-		}
+	if ip, _, ok := c.mdnsEndpoint(deviceName); ok {
+		return ip, nil
 	}
 	return nil, fmt.Errorf("no IPv4 address known for %q", deviceName)
+}
+
+// mdnsEndpoint looks up the camera's IPv4 and HAP port from the mDNS cache.
+// It tries the exact configured name first, then any instance whose name is
+// the configured name plus a rename suffix — a camera that reboots before
+// its previous record expires re-registers as "Name (2)".
+func (c *Controller) mdnsEndpoint(deviceName string) (net.IP, int, bool) {
+	c.mu.Lock()
+	var candidates []*hkontroller.Device
+	if d, ok := c.devices[deviceName]; ok {
+		candidates = append(candidates, d)
+	}
+	for name, d := range c.devices {
+		if name != deviceName && strings.HasPrefix(name, deviceName) {
+			candidates = append(candidates, d)
+		}
+	}
+	c.mu.Unlock()
+
+	if len(candidates) == 0 {
+		if d := c.controller.GetDevice(deviceName); d != nil {
+			candidates = append(candidates, d)
+		}
+	}
+
+	for _, d := range candidates {
+		entry := d.GetDnssdEntry()
+		for _, ip := range entry.IPs {
+			if ip4 := ip.To4(); ip4 != nil {
+				return ip4, int(entry.Port), true
+			}
+		}
+	}
+	return nil, 0, false
 }
 
 // Start begins mDNS discovery and connects to known devices.
@@ -171,6 +212,22 @@ func (c *Controller) discoveryLoop(ctx context.Context, discoverCh, lostCh <-cha
 				"wasLost", wasLost)
 			if wasLost && device.IsPaired() {
 				go c.recoverDevice(ctx, device.Name)
+			} else if !wasLost {
+				// A camera that reboots before its old mDNS record expires
+				// re-registers under a rename-suffixed instance ("Name (2)")
+				// that reports paired=false. Treat its appearance as the
+				// rediscovery of the lost original so auto-recovery fires;
+				// reconnect resolves the address via mdnsEndpoint, which
+				// accepts suffixed instances.
+				for lostName := range lost {
+					if lostName != device.Name && strings.HasPrefix(device.Name, lostName) {
+						delete(lost, lostName)
+						c.logger.Info("lost device reappeared under renamed mDNS instance",
+							"original", lostName, "instance", device.Name)
+						go c.recoverDevice(ctx, lostName)
+						break
+					}
+				}
 			}
 		case device, ok := <-lostCh:
 			if !ok {
@@ -442,20 +499,24 @@ func (c *Controller) reconnect(deviceName string) error {
 		return fmt.Errorf("no accessory public key for %q", deviceName)
 	}
 
-	entry := device.GetDnssdEntry()
-	if len(entry.IPs) == 0 {
-		return fmt.Errorf("no IPs known for %q", deviceName)
-	}
-
+	// Resolve the camera's current address: fresh mDNS data first (exact
+	// name, then rename-suffixed instances like "Name (2)" that appear when
+	// the camera reboots before its old record expires), falling back to
+	// the previous connection's remote address (cameras usually keep their
+	// IP and HAP port across reboots).
 	var deviceAddr string
-	for _, ip := range entry.IPs {
-		if ip.To4() != nil {
-			deviceAddr = fmt.Sprintf("%s:%d", ip.String(), entry.Port)
-			break
+	if ip, port, ok := c.mdnsEndpoint(deviceName); ok {
+		deviceAddr = fmt.Sprintf("%s:%d", ip, port)
+	} else {
+		c.mu.Lock()
+		prev := c.verified[deviceName]
+		c.mu.Unlock()
+		if prev != nil && prev.Conn != nil {
+			deviceAddr = prev.Conn.RemoteAddr().String()
 		}
 	}
 	if deviceAddr == "" {
-		deviceAddr = fmt.Sprintf("[%s]:%d", entry.IPs[0].String(), entry.Port)
+		return fmt.Errorf("no address known for %q", deviceName)
 	}
 
 	c.logger.Info("performing pair-verify (reconnect)", "name", deviceName, "addr", deviceAddr)
