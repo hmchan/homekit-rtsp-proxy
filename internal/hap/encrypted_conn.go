@@ -2,6 +2,7 @@ package hap
 
 import (
 	"bufio"
+	"crypto/cipher"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -22,10 +23,12 @@ type EncryptedConn struct {
 	conn net.Conn
 	rw   *bufio.ReadWriter
 
-	encryptKey [32]byte
-	decryptKey [32]byte
-	encryptCnt uint64
-	decryptCnt uint64
+	// AEADs are constructed once at session setup; the keys never change
+	// for the lifetime of the connection.
+	encryptAEAD cipher.AEAD
+	decryptAEAD cipher.AEAD
+	encryptCnt  uint64
+	decryptCnt  uint64
 
 	wmu sync.Mutex
 
@@ -38,16 +41,27 @@ type EncryptedConn struct {
 // readKey and writeKey are derived from pair-verify's shared secret.
 // IMPORTANT: "Read" and "Write" keys are named from the accessory's perspective.
 // As a client (controller), we encrypt with writeKey and decrypt with readKey.
-func NewEncryptedConn(conn net.Conn, readKey, writeKey [32]byte) *EncryptedConn {
+func NewEncryptedConn(conn net.Conn, readKey, writeKey [32]byte) (*EncryptedConn, error) {
+	// We encrypt with "Write" key (accessory reads with it) and decrypt
+	// with "Read" key (accessory writes with it).
+	encAEAD, err := chacha20poly1305.New(writeKey[:])
+	if err != nil {
+		return nil, fmt.Errorf("create encrypt AEAD: %w", err)
+	}
+	decAEAD, err := chacha20poly1305.New(readKey[:])
+	if err != nil {
+		return nil, fmt.Errorf("create decrypt AEAD: %w", err)
+	}
+
 	return &EncryptedConn{
 		conn: conn,
 		rw: bufio.NewReadWriter(
 			bufio.NewReader(conn),
 			bufio.NewWriter(conn),
 		),
-		encryptKey: writeKey, // We encrypt with "Write" key (accessory reads with it)
-		decryptKey: readKey,  // We decrypt with "Read" key (accessory writes with it)
-	}
+		encryptAEAD: encAEAD,
+		decryptAEAD: decAEAD,
+	}, nil
 }
 
 // Write encrypts and sends data, chunking into 1024-byte frames.
@@ -55,10 +69,7 @@ func (c *EncryptedConn) Write(b []byte) (int, error) {
 	c.wmu.Lock()
 	defer c.wmu.Unlock()
 
-	aead, err := chacha20poly1305.New(c.encryptKey[:])
-	if err != nil {
-		return 0, fmt.Errorf("create AEAD: %w", err)
-	}
+	aead := c.encryptAEAD
 
 	total := 0
 	for len(b) > 0 {
@@ -105,10 +116,7 @@ func (c *EncryptedConn) Read(b []byte) (int, error) {
 		return n, nil
 	}
 
-	aead, err := chacha20poly1305.New(c.decryptKey[:])
-	if err != nil {
-		return 0, fmt.Errorf("create AEAD: %w", err)
-	}
+	aead := c.decryptAEAD
 
 	// Read 2-byte plaintext length.
 	var lengthBytes [2]byte

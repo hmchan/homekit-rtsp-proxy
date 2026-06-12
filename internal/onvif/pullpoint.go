@@ -100,12 +100,31 @@ func NewPullPointManager() *PullPointManager {
 	}
 }
 
-// Create creates a new subscription and returns it.
+// maxSubscriptions bounds the subscription table. Legitimate consumers
+// (Scrypted, HA) hold one or two; without a cap any client can grow the
+// map without limit (entries persist 60 s each).
+const maxSubscriptions = 64
+
+// Create creates a new subscription and returns it. Returns nil when the
+// table is full even after evicting expired entries; callers should reply
+// with a 503.
 func (m *PullPointManager) Create(id string, timeout time.Duration) *PullPointSubscription {
-	sub := NewPullPointSubscription(id, timeout)
 	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if len(m.subscriptions) >= maxSubscriptions {
+		for sid, sub := range m.subscriptions {
+			if sub.IsExpired() {
+				delete(m.subscriptions, sid)
+			}
+		}
+		if len(m.subscriptions) >= maxSubscriptions {
+			return nil
+		}
+	}
+
+	sub := NewPullPointSubscription(id, timeout)
 	m.subscriptions[id] = sub
-	m.mu.Unlock()
 	return sub
 }
 

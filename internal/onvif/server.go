@@ -89,6 +89,11 @@ func (s *Server) Start() error {
 	s.httpServer = &http.Server{
 		Addr:    fmt.Sprintf("%s:%d", s.listenAddr, s.port),
 		Handler: mux,
+		// WriteTimeout must outlast the 30 s PullMessages long-poll.
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      40 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	// Start expired subscription cleanup.
@@ -171,8 +176,12 @@ func extractAction(body []byte) string {
 	return ""
 }
 
-func (s *Server) readBody(r *http.Request) ([]byte, error) {
-	body, err := io.ReadAll(r.Body)
+// maxSOAPBody caps request bodies; real ONVIF SOAP requests are well under
+// 64 KB, and an uncapped ReadAll lets any client exhaust memory.
+const maxSOAPBody = 64 << 10
+
+func (s *Server) readBody(w http.ResponseWriter, r *http.Request) ([]byte, error) {
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxSOAPBody))
 	if err != nil {
 		return nil, err
 	}
@@ -185,7 +194,7 @@ func (s *Server) writeSOAP(w http.ResponseWriter, content string) {
 }
 
 func (s *Server) handleDeviceService(w http.ResponseWriter, r *http.Request) {
-	body, err := s.readBody(r)
+	body, err := s.readBody(w, r)
 	if err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
@@ -240,7 +249,7 @@ func (s *Server) handleDeviceService(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleMediaService(w http.ResponseWriter, r *http.Request) {
-	body, err := s.readBody(r)
+	body, err := s.readBody(w, r)
 	if err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
@@ -297,7 +306,7 @@ func (s *Server) handleMediaService(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleEventService(w http.ResponseWriter, r *http.Request) {
-	body, err := s.readBody(r)
+	body, err := s.readBody(w, r)
 	if err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
@@ -314,6 +323,11 @@ func (s *Server) handleEventService(w http.ResponseWriter, r *http.Request) {
 		subID := uuid.New().String()
 		timeout := 60 * time.Second
 		sub := s.pullpoints.Create(subID, timeout)
+		if sub == nil {
+			s.logger.Warn("pullpoint subscription limit reached, rejecting")
+			http.Error(w, "too many subscriptions", http.StatusServiceUnavailable)
+			return
+		}
 
 		now := time.Now().UTC().Format(time.RFC3339)
 		termination := sub.TerminationTime.UTC().Format(time.RFC3339)
@@ -338,7 +352,7 @@ func (s *Server) handlePullPoint(w http.ResponseWriter, r *http.Request) {
 	}
 	subID := parts[len(parts)-1]
 
-	body, err := s.readBody(r)
+	body, err := s.readBody(w, r)
 	if err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return

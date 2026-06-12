@@ -91,7 +91,8 @@ func main() {
 		camName := cam.Name
 		camLogger := logger.With("camera", camName)
 
-		camLogger.Info("connecting to camera", "setup_code", cam.SetupCode)
+		// Note: never log cam.SetupCode — it is a pairing credential.
+		camLogger.Info("connecting to camera")
 
 		var pairErr error
 		for attempt := 1; attempt <= 6; attempt++ {

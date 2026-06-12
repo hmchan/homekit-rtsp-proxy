@@ -19,6 +19,12 @@ RUN sed -i 's/^Components: main$/Components: main non-free/' /etc/apt/sources.li
         libavcodec59 libavutil57 libswscale6 \
         ca-certificates \
         && rm -rf /var/lib/apt/lists/*
+# Run unprivileged: the process parses camera-supplied H.264/AAC in-process
+# via libavcodec/libfdk-aac, so contain any parser compromise. UID 1000
+# matches the pi user on the host, which owns the bind-mounted data dir.
+RUN useradd --uid 1000 --user-group --home-dir /app/data \
+        --shell /usr/sbin/nologin proxy
 COPY --from=builder /app/homekit-rtsp-proxy /app/homekit-rtsp-proxy
 WORKDIR /app/data
+USER proxy
 CMD ["/app/homekit-rtsp-proxy", "-config", "config.yaml"]

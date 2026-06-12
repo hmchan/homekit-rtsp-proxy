@@ -113,10 +113,9 @@ static int encode_frame(HANDLE_AACENCODER enc, INT_PCM *in, int inSamples, unsig
 import "C"
 
 import (
-	"encoding/binary"
 	"encoding/hex"
 	"fmt"
-	"os"
+	"log/slog"
 	"strings"
 	"unsafe"
 )
@@ -125,6 +124,7 @@ import (
 // AAC-ELD uses 480 or 512 samples/frame; AAC-LC uses 1024. We accumulate
 // decoded PCM in a ring buffer and encode whenever we have a full LC frame.
 type AudioTranscoder struct {
+	logger *slog.Logger
 	gain int // PCM gain factor (0 = mute, 512 = ~54dB)
 	decoder C.HANDLE_AACDECODER
 	encoder C.HANDLE_AACENCODER
@@ -187,28 +187,23 @@ func eldASCCandidates(sampleRate int) []string {
 }
 
 // NewAudioTranscoder creates a transcoder that decodes AAC-ELD and encodes AAC-LC.
-// It tries multiple ASC configurations to find one that works with the camera's
-// actual encoding format.
-func NewAudioTranscoder(sampleRate int, eldASCHex string, gain int) (*AudioTranscoder, error) {
-	// Run a self-test to verify FDK-AAC's ELD encoder+decoder work on this platform.
-	selfTestELD(sampleRate)
-
-	// Use the same ASC that our self-test ELD encoder produces (F8F02000 for 16kHz).
-	// This is the standard AAC-ELD configuration without SBR.
-	// Auto-detection found audio was present but ~60dB too quiet with SBR ASCs,
-	// suggesting the camera uses plain ELD (no SBR) matching the self-test config.
+func NewAudioTranscoder(sampleRate int, eldASCHex string, gain int, logger *slog.Logger) (*AudioTranscoder, error) {
+	// Plain ELD without SBR matches this camera's output. Auto-detection
+	// (still available via ascCandidates) found SBR ASCs decoded ~60dB
+	// too quiet.
 	asc := eldASCHex // default from caller
-	fmt.Printf("[audio_transcoder] using ASC %s for %dHz (no auto-detection)\n", asc, sampleRate)
 
 	t, err := newTranscoderWithASC(sampleRate, asc)
 	if err != nil {
 		return nil, fmt.Errorf("init transcoder with ASC %s: %w", asc, err)
 	}
 
+	t.logger = logger
 	t.gain = gain
 	t.sampleRate = sampleRate
 	t.detecting = false // no auto-detection
 
+	logger.Info("audio transcoder configured", "asc", asc, "sampleRate", sampleRate, "gain", gain)
 	return t, nil
 }
 
@@ -321,9 +316,9 @@ func (t *AudioTranscoder) Transcode(aacELDFrame []byte) ([]byte, error) {
 		t.detecting = false
 		bestASC, err := t.autoDetectASC()
 		if err != nil {
-			fmt.Printf("[audio_transcoder] auto-detect failed: %v, keeping %s\n", err, t.eldASCHex)
+			t.logger.Warn("audio ASC auto-detect failed", "error", err, "keeping", t.eldASCHex)
 		} else if bestASC != t.eldASCHex {
-			fmt.Printf("[audio_transcoder] switching ASC from %s to %s\n", t.eldASCHex, bestASC)
+			t.logger.Info("audio ASC switched", "from", t.eldASCHex, "to", bestASC)
 			// Re-create decoder with the winning ASC.
 			C.aacDecoder_Close(t.decoder)
 			t.decoder = C.aacDecoder_Open(C.TT_MP4_RAW, 1)
@@ -417,8 +412,9 @@ func (t *AudioTranscoder) autoDetectASC() (string, error) {
 			maxPCM:  int(maxPCM),
 			decoded: decodedFrames,
 		})
-		fmt.Printf("[audio_detect] ASC=%s decoded=%d/%d maxPCM=%d info=%s\n",
-			asc, decodedFrames, len(t.detectFrames), maxPCM, streamInfo)
+		t.logger.Debug("audio ASC candidate tested",
+			"asc", asc, "decoded", decodedFrames, "of", len(t.detectFrames),
+			"maxPCM", int(maxPCM), "info", streamInfo)
 	}
 
 	// Pick the ASC with the highest peak PCM.
@@ -435,7 +431,7 @@ func (t *AudioTranscoder) autoDetectASC() (string, error) {
 		return "", fmt.Errorf("no valid ASC candidate found")
 	}
 
-	fmt.Printf("[audio_detect] winner: ASC=%s maxPCM=%d\n", results[bestIdx].asc, bestPCM)
+	t.logger.Info("audio ASC auto-detected", "asc", results[bestIdx].asc, "maxPCM", bestPCM)
 	return results[bestIdx].asc, nil
 }
 
@@ -456,8 +452,9 @@ func (t *AudioTranscoder) transcodeFrame(aacELDFrame []byte) ([]byte, error) {
 	decoded := int(nSamples)
 	t.frameCount++
 
-	// Log peak PCM from production decoder.
-	if t.frameCount <= 5 || t.frameCount%50 == 0 {
+	// Peak-PCM diagnostics, debug level only (was the main source of log
+	// spam: an unconditional printf once per second, forever).
+	if t.logger.Enabled(nil, slog.LevelDebug) && (t.frameCount <= 5 || t.frameCount%50 == 0) {
 		var maxPCM C.INT_PCM
 		for i := 0; i < decoded; i++ {
 			s := t.decBuf[i]
@@ -468,8 +465,8 @@ func (t *AudioTranscoder) transcodeFrame(aacELDFrame []byte) ([]byte, error) {
 				maxPCM = s
 			}
 		}
-		fmt.Printf("[audio_transcoder] frame=%d decoded=%d maxPCM=%d sizeof(INT_PCM)=%d\n",
-			t.frameCount, decoded, int(maxPCM), unsafe.Sizeof(t.decBuf[0]))
+		t.logger.Debug("audio transcode stats",
+			"frame", t.frameCount, "decoded", decoded, "maxPCM", int(maxPCM))
 	}
 
 
@@ -570,150 +567,6 @@ func (t *AudioTranscoder) TestDecodePeakPCM(data []byte) int {
 		}
 	}
 	return int(maxPCM)
-}
-
-// dumpFrame appends raw AAC and decoded PCM to files for offline analysis.
-func (t *AudioTranscoder) dumpFrame(aacFrame []byte, decodedSamples int) {
-	// Dump raw AAC frame (length-prefixed).
-	if f, err := os.OpenFile("/tmp/audio_aac.bin", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644); err == nil {
-		lenBuf := make([]byte, 4)
-		binary.BigEndian.PutUint32(lenBuf, uint32(len(aacFrame)))
-		f.Write(lenBuf)
-		f.Write(aacFrame)
-		f.Close()
-	}
-
-	// Dump decoded PCM (16-bit signed LE).
-	if f, err := os.OpenFile("/tmp/audio_pcm.raw", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644); err == nil {
-		pcmBytes := make([]byte, decodedSamples*2)
-		for i := 0; i < decodedSamples; i++ {
-			binary.LittleEndian.PutUint16(pcmBytes[i*2:], uint16(t.decBuf[i]))
-		}
-		f.Write(pcmBytes)
-		f.Close()
-	}
-}
-
-// selfTestELD runs a quick roundtrip test: encode a 1kHz sine wave as AAC-ELD,
-// decode it back, and verify the PCM is non-trivial. This validates that FDK-AAC's
-// ELD encoder+decoder actually work on this platform.
-func selfTestELD(sampleRate int) {
-	fmt.Printf("[audio_transcoder] self-test: encoding 1kHz sine as AAC-ELD at %dHz...\n", sampleRate)
-
-	// Create ELD encoder.
-	var enc C.HANDLE_AACENCODER
-	if C.aacEncOpen(&enc, 0, 1) != C.AACENC_OK {
-		fmt.Printf("[audio_transcoder] self-test: FAILED to open ELD encoder\n")
-		return
-	}
-	defer C.aacEncClose(&enc)
-
-	params := []struct {
-		p C.AACENC_PARAM
-		v int
-	}{
-		{C.AACENC_AOT, C.AOT_ER_AAC_ELD},
-		{C.AACENC_SAMPLERATE, sampleRate},
-		{C.AACENC_CHANNELMODE, C.MODE_1},
-		{C.AACENC_BITRATE, 64000},
-		{C.AACENC_TRANSMUX, C.TT_MP4_RAW},
-	}
-	for _, p := range params {
-		if C.aacEncoder_SetParam(enc, p.p, C.UINT(p.v)) != C.AACENC_OK {
-			fmt.Printf("[audio_transcoder] self-test: FAILED to set encoder param %d\n", p.p)
-			return
-		}
-	}
-	if C.aacEncEncode(enc, nil, nil, nil, nil) != C.AACENC_OK {
-		fmt.Printf("[audio_transcoder] self-test: FAILED to init encoder\n")
-		return
-	}
-
-	// Get encoder info (frame size + ASC).
-	var info C.AACENC_InfoStruct
-	if C.aacEncInfo(enc, &info) != C.AACENC_OK {
-		fmt.Printf("[audio_transcoder] self-test: FAILED to get encoder info\n")
-		return
-	}
-	frameSize := int(info.frameLength)
-	fmt.Printf("[audio_transcoder] self-test: ELD encoder frameSize=%d\n", frameSize)
-
-	// Extract ELD encoder's ASC.
-	ascSize := int(info.confSize)
-	eldASC := make([]byte, ascSize)
-	for i := 0; i < ascSize; i++ {
-		eldASC[i] = byte(info.confBuf[i])
-	}
-	fmt.Printf("[audio_transcoder] self-test: ELD encoder ASC=%X\n", eldASC)
-
-	// Create decoder with the encoder's ASC.
-	dec := C.aacDecoder_Open(C.TT_MP4_RAW, 1)
-	if dec == nil {
-		fmt.Printf("[audio_transcoder] self-test: FAILED to open decoder\n")
-		return
-	}
-	defer C.aacDecoder_Close(dec)
-
-	rc := C.config_raw(dec, (*C.uchar)(unsafe.Pointer(&eldASC[0])), C.uint(len(eldASC)))
-	if rc != C.AAC_DEC_OK {
-		fmt.Printf("[audio_transcoder] self-test: FAILED to configure decoder: %d\n", rc)
-		return
-	}
-
-	// Generate 1kHz sine wave and encode+decode 10 frames.
-	pcmIn := make([]C.INT_PCM, frameSize)
-	encOut := make([]byte, 2048)
-	decOut := make([]C.INT_PCM, 8192)
-
-	for frame := 0; frame < 10; frame++ {
-		// Fill PCM with 1kHz sine at ~50% amplitude.
-		for i := 0; i < frameSize; i++ {
-			sample := int(frame)*frameSize + i
-			// sin(2*pi*1000*t/sampleRate) * 16000
-			// Use integer approximation to avoid importing math.
-			phase := (sample * 1000 * 4) / sampleRate // quarter-periods
-			switch phase % 4 {
-			case 0:
-				pcmIn[i] = 0
-			case 1:
-				pcmIn[i] = 16000
-			case 2:
-				pcmIn[i] = 0
-			case 3:
-				pcmIn[i] = -16000
-			}
-		}
-
-		// Encode.
-		n := C.encode_frame(enc, &pcmIn[0], C.int(frameSize),
-			(*C.uchar)(unsafe.Pointer(&encOut[0])), C.int(len(encOut)))
-		if n <= 0 {
-			fmt.Printf("[audio_transcoder] self-test: encode failed at frame %d: %d\n", frame, n)
-			continue
-		}
-
-		// Decode.
-		ns := C.decode_frame(dec, (*C.uchar)(unsafe.Pointer(&encOut[0])), C.int(n),
-			&decOut[0], C.int(len(decOut)))
-		if ns <= 0 {
-			fmt.Printf("[audio_transcoder] self-test: decode failed at frame %d: %d\n", frame, ns)
-			continue
-		}
-
-		// Measure peak PCM.
-		var maxPCM C.INT_PCM
-		for i := 0; i < int(ns); i++ {
-			s := decOut[i]
-			if s < 0 {
-				s = -s
-			}
-			if s > maxPCM {
-				maxPCM = s
-			}
-		}
-		fmt.Printf("[audio_transcoder] self-test: frame=%d encoded=%d decoded=%d maxPCM=%d\n",
-			frame, int(n), int(ns), int(maxPCM))
-	}
 }
 
 // AudioSpecificConfig returns the AAC-LC AudioSpecificConfig from the encoder,

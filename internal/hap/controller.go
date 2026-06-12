@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -117,6 +118,10 @@ func (c *Controller) Start(ctx context.Context) error {
 	if err := ctrl.LoadPairings(); err != nil {
 		c.logger.Warn("failed to load pairings", "error", err)
 	}
+
+	// The hkontroller store holds our long-term Ed25519 private key; the
+	// library creates it with default umask permissions (world-readable).
+	c.hardenStorePerms()
 
 	// Start mDNS discovery.
 	dctx, cancel := context.WithCancel(ctx)
@@ -263,6 +268,8 @@ func (c *Controller) PairCamera(ctx context.Context, deviceName, setupCode strin
 		c.logger.Info("pair-setup complete", "name", deviceName)
 		// Close the pair-setup connection.
 		device.Close()
+		// Pair-setup just wrote fresh pairing files with umask permissions.
+		c.hardenStorePerms()
 	}
 
 	// Step 2: Get the keys we need for pair-verify.
@@ -357,6 +364,33 @@ func (c *Controller) PairCamera(ctx context.Context, deviceName, setupCode strin
 
 	c.logger.Info("camera paired and verified", "name", deviceName)
 	return nil
+}
+
+// hardenStorePerms tightens permissions on the hkontroller file store
+// (controller keypair + accessory pairings). Safe to call repeatedly; new
+// files appear after pair-setup, so it runs at startup and after pairing.
+func (c *Controller) hardenStorePerms() {
+	if err := os.Chmod(c.storePath, 0o700); err != nil {
+		if !os.IsNotExist(err) {
+			c.logger.Warn("chmod key store dir", "path", c.storePath, "error", err)
+		}
+		return
+	}
+	entries, err := os.ReadDir(c.storePath)
+	if err != nil {
+		c.logger.Warn("read key store dir", "path", c.storePath, "error", err)
+		return
+	}
+	for _, e := range entries {
+		mode := os.FileMode(0o600)
+		if e.IsDir() {
+			mode = 0o700
+		}
+		p := filepath.Join(c.storePath, e.Name())
+		if err := os.Chmod(p, mode); err != nil {
+			c.logger.Warn("chmod key store file", "path", p, "error", err)
+		}
+	}
 }
 
 // readControllerKeys reads the controller's Ed25519 keypair from the hkontroller store.

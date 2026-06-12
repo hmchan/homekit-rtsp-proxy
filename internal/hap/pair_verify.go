@@ -173,7 +173,10 @@ func doPairVerifyOnConn(conn net.Conn, controllerID string, controllerLTSK ed255
 	conn.SetDeadline(time.Time{})
 
 	// Create encrypted connection wrapper and HAP client.
-	enc := NewEncryptedConn(conn, readKey, writeKey)
+	enc, err := NewEncryptedConn(conn, readKey, writeKey)
+	if err != nil {
+		return nil, fmt.Errorf("init encrypted conn: %w", err)
+	}
 	client := NewHAPClient(enc)
 
 	return &VerifiedConn{

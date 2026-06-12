@@ -135,7 +135,7 @@ func NewRTSPServer(cfg RTSPServerConfig, session *Session, logger *slog.Logger) 
 				eldASC = "F8F82000"
 			}
 
-			transcoder, err := NewAudioTranscoder(sampleRate, eldASC, cfg.AudioGain)
+			transcoder, err := NewAudioTranscoder(sampleRate, eldASC, cfg.AudioGain, logger)
 			if err != nil {
 				logger.Error("failed to create audio transcoder, audio disabled", "error", err)
 				break
@@ -487,8 +487,11 @@ func parseSTAPA(payload []byte) (sps, pps []byte) {
 // If a transcoder is active, it strips the AU header, transcodes AAC-ELD → AAC-LC,
 // and re-adds an AU header with the new frame size.
 func (s *RTSPServer) WriteAudioPacket(pkt *rtp.Packet) {
+	// Read stream and transcoder under the lock: Stop() nils both, and the
+	// audio goroutine may still be in flight during shutdown.
 	s.mu.Lock()
 	stream := s.stream
+	transcoder := s.transcoder
 	s.mu.Unlock()
 
 	if stream == nil || len(s.medias) < 2 {
@@ -498,11 +501,11 @@ func (s *RTSPServer) WriteAudioPacket(pkt *rtp.Packet) {
 	// Rewrite payload type to match SDP (camera sends PT 110, SDP has PT 97).
 	pkt.Header.PayloadType = s.audioPT
 
-	if s.transcoder != nil && len(pkt.Payload) > 4 {
+	if transcoder != nil && len(pkt.Payload) > 4 {
 		// Strip 4-byte RFC 3640 AU header to get raw AAC-ELD frame.
 		rawELD := pkt.Payload[4:]
 
-		rawLC, err := s.transcoder.Transcode(rawELD)
+		rawLC, err := transcoder.Transcode(rawELD)
 		if err != nil {
 			s.logger.Warn("audio transcode error", "error", err)
 			return
@@ -550,9 +553,13 @@ func (s *RTSPServer) Stop() {
 		s.transcoder = nil
 	}
 
+	// Close the snapshotter but keep the pointer: LatestSnapshotJPEG and the
+	// IDR cache path read s.snapshotter without s.mu, which is only safe
+	// because the field is never written after construction. Close() makes
+	// it inert (Update/LatestJPEG check the internal ctx under their own
+	// lock).
 	if s.snapshotter != nil {
 		s.snapshotter.Close()
-		s.snapshotter = nil
 	}
 
 	if s.stream != nil {
