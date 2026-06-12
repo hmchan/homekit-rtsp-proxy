@@ -48,7 +48,6 @@ type cameraCharIDs struct {
 type Controller struct {
 	store      *PairingStore
 	logger     *slog.Logger
-	bindAddr   string
 	storePath  string // path to hkontroller file store
 
 	mu              sync.Mutex
@@ -67,17 +66,40 @@ type Controller struct {
 }
 
 // NewController creates a new HAP controller.
-func NewController(store *PairingStore, bindAddr string, logger *slog.Logger) *Controller {
+func NewController(store *PairingStore, logger *slog.Logger) *Controller {
 	return &Controller{
 		store:     store,
 		logger:    logger,
-		bindAddr:  bindAddr,
 		storePath:       "./.hkontroller",
 		devices:         make(map[string]*hkontroller.Device),
 		verified:        make(map[string]*VerifiedConn),
 		charIDs:         make(map[string]*cameraCharIDs),
 		motionCallbacks: make(map[string]func(bool)),
 	}
+}
+
+// GetCameraIP returns the IPv4 address the camera was discovered at via mDNS.
+// Returned IP is suitable for computing which local interface routes to the
+// camera, so multiple cameras on different VLANs each get the correct local
+// source address for their SRTP return path.
+func (c *Controller) GetCameraIP(deviceName string) (net.IP, error) {
+	c.mu.Lock()
+	device, ok := c.devices[deviceName]
+	c.mu.Unlock()
+	if !ok {
+		device = c.controller.GetDevice(deviceName)
+		if device == nil {
+			return nil, fmt.Errorf("device %q not found via mDNS", deviceName)
+		}
+	}
+
+	entry := device.GetDnssdEntry()
+	for _, ip := range entry.IPs {
+		if ip4 := ip.To4(); ip4 != nil {
+			return ip4, nil
+		}
+	}
+	return nil, fmt.Errorf("no IPv4 address known for %q", deviceName)
 }
 
 // Start begins mDNS discovery and connects to known devices.

@@ -2,8 +2,10 @@
 
 log_level: info                    # debug, info, warn, error
 pairing_store: ./pairings.json     # Path to persist HomeKit pairing keys
-# bind_address: 192.168.1.10      # Override auto-detected local IP (used for the
-                                   # camera-side SRTP return path; must be LAN-routable)
+# bind_address: 192.168.1.10      # Force a single local IP for the camera-side
+                                   # SRTP return path. Default: auto-detect per
+                                   # camera from the route to its discovered IP
+                                   # (works across multiple interfaces/VLANs).
 # listen_address: 127.0.0.1       # Restrict the RTSP and ONVIF listeners to this
                                    # interface. Empty (default) = listen on all
                                    # interfaces. Use 127.0.0.1 if all consumers

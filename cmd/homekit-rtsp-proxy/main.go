@@ -63,15 +63,16 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Determine bind address.
-	bindAddr := cfg.BindAddress
-	if bindAddr == "" {
-		bindAddr = detectLocalIP()
+	// The camera-side SRTP local IP is resolved per-camera at stream start
+	// (see onStart below), based on the route to each camera's discovered
+	// address. cfg.BindAddress, if set, forces a single IP for all cameras
+	// (legacy single-interface override).
+	if cfg.BindAddress != "" {
+		logger.Info("bind_address override active", "address", cfg.BindAddress)
 	}
-	logger.Info("using bind address", "address", bindAddr)
 
 	// Create HAP controller.
-	controller := hap.NewController(store, bindAddr, logger)
+	controller := hap.NewController(store, logger)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -131,13 +132,21 @@ func main() {
 		var rtspServer *stream.RTSPServer
 
 		// Create on-demand session. We declare it first so closures can reference it.
-		localIP := net.ParseIP(bindAddr)
 		var session *stream.Session
 		session = stream.NewSession(cam.Name, cam.RTSP.IdleTimeout, camLogger,
 			// onStart: called when first RTSP client connects.
 			func() error {
 				camLogger.Info("starting camera stream")
 				rtspServer.ResetVideoRTP()
+
+				// Resolve the local source IP that routes to this camera. Done
+				// per-stream (not once at startup) so the camera can move
+				// between interfaces/VLANs, change IP after a reboot, etc.
+				localIP, err := resolveLocalIP(controller, cam.Name, cfg.BindAddress)
+				if err != nil {
+					return fmt.Errorf("resolve local IP for %s: %w", cam.Name, err)
+				}
+				camLogger.Info("resolved SRTP local IP", "localIP", localIP)
 
 				// Open UDP ports first, so we know the actual ports for SetupEndpoints.
 				videoPort, audioPort, err := srtpProxy.OpenPorts(0, 0)
@@ -250,12 +259,17 @@ func main() {
 			os.Exit(1)
 		}
 
-		// Advertise the address consumers actually reach us on. When
-		// ListenAddress is set (e.g. 127.0.0.1) it overrides bindAddr,
-		// which is reserved for the camera-side SRTP path.
-		advertiseAddr := bindAddr
-		if cfg.ListenAddress != "" {
-			advertiseAddr = cfg.ListenAddress
+		// Advertise the address consumers actually reach us on. Prefer
+		// ListenAddress (the consumer-facing bind, e.g. 127.0.0.1); fall back
+		// to BindAddress if it's set as a global override; otherwise 0.0.0.0
+		// (the listener is on all interfaces and the URL is only used for
+		// display / ONVIF metadata).
+		advertiseAddr := cfg.ListenAddress
+		if advertiseAddr == "" {
+			advertiseAddr = cfg.BindAddress
+		}
+		if advertiseAddr == "" {
+			advertiseAddr = "0.0.0.0"
 		}
 		rtspURL := fmt.Sprintf("rtsp://%s:%d%s", advertiseAddr, cam.RTSP.Port, cam.RTSP.Path)
 		camLogger.Info("RTSP URL available", "url", rtspURL)
@@ -347,12 +361,32 @@ func main() {
 	logger.Info("shutdown complete")
 }
 
-// detectLocalIP finds the primary outbound IP address.
-func detectLocalIP() string {
-	conn, err := net.Dial("udp4", "8.8.8.8:80")
+// resolveLocalIP returns the local IPv4 source address that the kernel will use
+// to reach the named camera. If override is non-empty, it is parsed and returned
+// as-is (bind_address config takes precedence over auto-detection).
+//
+// Otherwise the function looks up the camera's discovered IP via mDNS and asks
+// the kernel which interface routes to it (via a UDP Dial that never sends a
+// packet). This works correctly when cameras live on different interfaces or
+// VLANs — each gets a local source IP on the right interface.
+func resolveLocalIP(c *hap.Controller, deviceName, override string) (net.IP, error) {
+	if override != "" {
+		ip := net.ParseIP(override)
+		if ip == nil {
+			return nil, fmt.Errorf("bind_address %q is not a valid IP", override)
+		}
+		return ip, nil
+	}
+
+	cameraIP, err := c.GetCameraIP(deviceName)
 	if err != nil {
-		return "0.0.0.0"
+		return nil, err
+	}
+
+	conn, err := net.Dial("udp4", net.JoinHostPort(cameraIP.String(), "80"))
+	if err != nil {
+		return nil, fmt.Errorf("no route to camera %s: %w", cameraIP, err)
 	}
 	defer conn.Close()
-	return conn.LocalAddr().(*net.UDPAddr).IP.String()
+	return conn.LocalAddr().(*net.UDPAddr).IP, nil
 }

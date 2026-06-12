@@ -12,11 +12,15 @@ import (
 type Config struct {
 	LogLevel     string         `yaml:"log_level"`
 	PairingStore string         `yaml:"pairing_store"`
+	// BindAddress forces a single local IP for the camera-side SRTP return
+	// path across all cameras. Empty (default) = auto-detect per camera from
+	// the route to its mDNS-discovered IP, which is the right behavior when
+	// cameras live on different interfaces or VLANs. Only set this if you
+	// need to pin one specific source IP.
 	BindAddress  string         `yaml:"bind_address"`
 	// ListenAddress restricts the RTSP and ONVIF listeners to a specific
 	// interface (e.g. "127.0.0.1" to expose them only to local consumers).
-	// Empty = bind to all interfaces (default). BindAddress is unaffected
-	// since it must remain LAN-routable for the camera-side SRTP path.
+	// Empty = bind to all interfaces (default). Independent of BindAddress.
 	ListenAddress string         `yaml:"listen_address"`
 	Cameras       []CameraConfig `yaml:"cameras"`
 }
