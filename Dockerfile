@@ -23,8 +23,8 @@ RUN sed -i 's/^Components: main$/Components: main non-free/' /etc/apt/sources.li
 # via libavcodec/libfdk-aac, so contain any parser compromise. UID 1000
 # matches the pi user on the host, which owns the bind-mounted data dir.
 RUN useradd --uid 1000 --user-group --home-dir /app/data \
-        --shell /usr/sbin/nologin proxy
+        --shell /usr/sbin/nologin rtsp
 COPY --from=builder /app/homekit-rtsp-proxy /app/homekit-rtsp-proxy
 WORKDIR /app/data
-USER proxy
+USER rtsp
 CMD ["/app/homekit-rtsp-proxy", "-config", "config.yaml"]
