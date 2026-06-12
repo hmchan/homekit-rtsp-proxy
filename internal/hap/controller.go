@@ -347,23 +347,14 @@ func (c *Controller) PairCamera(ctx context.Context, deviceName, setupCode strin
 		"id", pairingInfo.Id,
 		"pubkey_len", len(pairingInfo.PublicKey))
 
-	// Step 3: Get the device's IP:port from mDNS.
-	entry := device.GetDnssdEntry()
-	if len(entry.IPs) == 0 {
+	// Step 3: Get the device's IP:port from mDNS. The exact name may carry
+	// no IPs (expired record, or the camera re-registered as "Name (2)"
+	// after a fast reboot), so accept rename-suffixed instances too.
+	ip, port, ok := c.mdnsEndpoint(deviceName)
+	if !ok {
 		return fmt.Errorf("no IPs known for %q", deviceName)
 	}
-
-	// Prefer IPv4.
-	var deviceAddr string
-	for _, ip := range entry.IPs {
-		if ip.To4() != nil {
-			deviceAddr = fmt.Sprintf("%s:%d", ip.String(), entry.Port)
-			break
-		}
-	}
-	if deviceAddr == "" {
-		deviceAddr = fmt.Sprintf("[%s]:%d", entry.IPs[0].String(), entry.Port)
-	}
+	deviceAddr := fmt.Sprintf("%s:%d", ip, port)
 
 	// Step 4: Perform pair-verify using our custom implementation.
 	c.logger.Info("performing pair-verify", "name", deviceName, "addr", deviceAddr)
