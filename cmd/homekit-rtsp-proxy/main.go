@@ -13,6 +13,7 @@ import (
 
 	"github.com/hmchan/homekit-rtsp-proxy/internal/config"
 	"github.com/hmchan/homekit-rtsp-proxy/internal/hap"
+	"github.com/hmchan/homekit-rtsp-proxy/internal/health"
 	"github.com/hmchan/homekit-rtsp-proxy/internal/onvif"
 	"github.com/hmchan/homekit-rtsp-proxy/internal/stream"
 )
@@ -111,6 +112,36 @@ func main() {
 		camLogger.Info("camera paired and connected")
 	}
 
+	// Optional MQTT health reporter for Home Assistant. Best-effort: a broker
+	// outage never affects streaming, and construction failure is non-fatal.
+	var reporter *health.Reporter
+	if cfg.MQTT.Enabled {
+		names := make([]string, 0, len(cfg.Cameras))
+		for _, c := range cfg.Cameras {
+			names = append(names, c.Name)
+		}
+		r, err := health.New(health.Config{
+			Broker:           cfg.MQTT.Broker,
+			Username:         cfg.MQTT.Username,
+			Password:         cfg.MQTT.Password,
+			ClientID:         cfg.MQTT.ClientID,
+			BaseTopic:        cfg.MQTT.BaseTopic,
+			DiscoveryPrefix:  cfg.MQTT.DiscoveryPrefix,
+			WedgeAfter:       cfg.MQTT.WedgeAfter,
+			DropThreshold:    cfg.MQTT.DropThreshold,
+			DropWindow:       cfg.MQTT.DropWindow,
+			DropClearWindow:  cfg.MQTT.DropClearWindow,
+			DeviceIdentifier: cfg.MQTT.DeviceIdentifier,
+			DeviceName:       cfg.MQTT.DeviceName,
+		}, names, logger)
+		if err != nil {
+			logger.Error("failed to init MQTT health reporter (continuing without it)", "error", err)
+		} else {
+			reporter = r
+			logger.Info("MQTT health reporter enabled", "broker", cfg.MQTT.Broker)
+		}
+	}
+
 	type cameraServices struct {
 		name       string
 		rtspServer *stream.RTSPServer
@@ -188,9 +219,11 @@ func main() {
 					uint16(videoPort), uint16(audioPort),
 					videoConfig, audioConfig)
 				if err != nil {
+					reporter.ReportStreamFailed(cam.Name, fmt.Sprintf("start HAP stream: %v", err))
 					srtpProxy.Close()
 					return fmt.Errorf("start HAP stream: %w", err)
 				}
+				reporter.ReportStreamStarted(cam.Name)
 
 				// Start SRTP decryption with camera's keys.
 				srtpCfg := stream.SRTPConfig{
@@ -208,12 +241,12 @@ func main() {
 						IP:   resp.RemoteIP,
 						Port: int(resp.RemoteAudioPort),
 					},
-					ControllerVideoKey:   resp.ControllerVideoKey,
-					ControllerVideoSalt:  resp.ControllerVideoSalt,
-					ControllerVideoSSRC:  resp.ControllerVideoSSRC,
-					ControllerAudioKey:   resp.ControllerAudioKey,
-					ControllerAudioSalt:  resp.ControllerAudioSalt,
-					ControllerAudioSSRC:  resp.ControllerAudioSSRC,
+					ControllerVideoKey:  resp.ControllerVideoKey,
+					ControllerVideoSalt: resp.ControllerVideoSalt,
+					ControllerVideoSSRC: resp.ControllerVideoSSRC,
+					ControllerAudioKey:  resp.ControllerAudioKey,
+					ControllerAudioSalt: resp.ControllerAudioSalt,
+					ControllerAudioSSRC: resp.ControllerAudioSSRC,
 				}
 
 				return srtpProxy.Start(srtpCfg)
@@ -254,6 +287,13 @@ func main() {
 				camLogger.Error("session restart after video stall failed", "error", err)
 			}
 		})
+		// Report per-second video quality to HA so frequent frame drops raise a
+		// signal. Only wired when the health reporter is enabled.
+		if reporter != nil {
+			srtpProxy.SetVideoStatsCallback(func(s stream.VideoStats) {
+				reporter.ReportVideoStats(cam.Name, s.Packets, s.Drops, s.DroppedFrames, s.Interval)
+			})
+		}
 
 		if err := rtspServer.Start(); err != nil {
 			camLogger.Error("failed to start RTSP server", "error", err)
@@ -358,6 +398,7 @@ func main() {
 		svc.srtpProxy.Close()
 	}
 
+	reporter.Close()
 	controller.Stop()
 	logger.Info("shutdown complete")
 }

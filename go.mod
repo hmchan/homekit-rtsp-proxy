@@ -4,7 +4,7 @@ go 1.25.0
 
 require (
 	github.com/bluenviron/gortsplib/v5 v5.3.2
-	github.com/bluenviron/mediacommon/v2 v2.8.0
+	github.com/eclipse/paho.mqtt.golang v1.5.1
 	github.com/google/uuid v1.6.0
 	github.com/hkontrol/hkontroller v0.0.0-20230308084657-4df431f26f16
 	github.com/pion/rtcp v1.2.16
@@ -15,6 +15,7 @@ require (
 )
 
 require (
+	github.com/bluenviron/mediacommon/v2 v2.8.0 // indirect
 	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/hkontrol/dnssd v0.0.0-20230308075609-ab9bce8c8a98 // indirect
 	github.com/miekg/dns v1.1.51 // indirect
@@ -27,6 +28,7 @@ require (
 	github.com/xiam/to v0.0.0-20200126224905-d60d31e03561 // indirect
 	golang.org/x/mod v0.9.0 // indirect
 	golang.org/x/net v0.50.0 // indirect
+	golang.org/x/sync v0.17.0 // indirect
 	golang.org/x/sys v0.41.0 // indirect
 	golang.org/x/tools v0.7.0 // indirect
 )

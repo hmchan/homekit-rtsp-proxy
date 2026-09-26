@@ -64,6 +64,11 @@ type SRTPProxy struct {
 	videoStallTimeout time.Duration // 0 = disabled
 	onVideoStall      func()        // fired async when stall is detected
 
+	// onVideoStats, if set, is called about once per second with per-interval
+	// video counters (see VideoStats). Used to report degraded video quality
+	// (frequent frame drops) to Home Assistant. Best-effort; must not block.
+	onVideoStats func(VideoStats)
+
 	stopCh chan struct{}
 	wg     sync.WaitGroup
 }
@@ -144,6 +149,24 @@ func (p *SRTPProxy) SetIDRCallback(onIDR func(*rtp.Packet)) {
 func (p *SRTPProxy) SetVideoStallCallback(stallTimeout time.Duration, onStall func()) {
 	p.videoStallTimeout = stallTimeout
 	p.onVideoStall = onStall
+}
+
+// VideoStats carries per-interval video counters, emitted about once per second
+// while a stream is active. Packets and Drops let a consumer compute packet loss
+// (Drops / (Packets + Drops)); DroppedFrames is whole frames discarded because
+// they were incomplete. All values are deltas over Interval, not cumulative.
+type VideoStats struct {
+	Packets       uint64        // video RTP packets received in the interval
+	Drops         uint64        // packets missing (RTP sequence gaps) in the interval
+	DroppedFrames uint64        // frames discarded (incomplete) in the interval
+	Interval      time.Duration // wall-clock span this sample covers
+}
+
+// SetVideoStatsCallback registers a callback invoked about once per second with
+// per-interval video counters. The callback runs on the video read loop, so it
+// must not block. Call before Start().
+func (p *SRTPProxy) SetVideoStatsCallback(onStats func(VideoStats)) {
+	p.onVideoStats = onStats
 }
 
 // OpenPorts opens UDP listeners on the specified ports (or random ports if 0).
@@ -271,9 +294,11 @@ func (p *SRTPProxy) readVideoLoop() {
 	var gapEvents, foreignDrops uint64
 	var lastSeq uint16
 	var lastFrameTS uint32
-	var frameGapped bool           // true if current frame has a sequence gap
-	var frameBuf []*pooledPacket   // buffered packets for current frame (pooled)
+	var frameGapped bool         // true if current frame has a sequence gap
+	var frameBuf []*pooledPacket // buffered packets for current frame (pooled)
 	lastLogTime := time.Now()
+	// Snapshots at the last stats emission, for computing per-interval deltas.
+	var lastStatVideo, lastStatDrops, lastStatDroppedFrames uint64
 
 	for {
 		n, raddr, err := p.videoConn.ReadFromUDP(buf)
@@ -428,7 +453,7 @@ func (p *SRTPProxy) readVideoLoop() {
 
 		// Log every second to track camera packet rate. Must run before the
 		// marker flush below, which releases pkt back to the pool.
-		if time.Since(lastLogTime) >= time.Second {
+		if now := time.Now(); now.Sub(lastLogTime) >= time.Second {
 			p.logger.Info("video RTP stats",
 				"total_packets", videoCount,
 				"rtcp_packets", rtcpCount,
@@ -437,7 +462,16 @@ func (p *SRTPProxy) readVideoLoop() {
 				"decrypt_errors", decryptErrors,
 				"seq", pkt.Header.SequenceNumber,
 				"ts", pkt.Header.Timestamp)
-			lastLogTime = time.Now()
+			if p.onVideoStats != nil {
+				p.onVideoStats(VideoStats{
+					Packets:       videoCount - lastStatVideo,
+					Drops:         dropCount - lastStatDrops,
+					DroppedFrames: droppedFrames - lastStatDroppedFrames,
+					Interval:      now.Sub(lastLogTime),
+				})
+			}
+			lastStatVideo, lastStatDrops, lastStatDroppedFrames = videoCount, dropCount, droppedFrames
+			lastLogTime = now
 		}
 
 		// End of frame (marker bit): flush the complete frame.
